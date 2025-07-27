@@ -41,6 +41,9 @@
 *.VC.db
 *.VC.opendb
 .vsconfig
+.vscode
+*.code-workspace
+
 
 # Precompiled Assets
 SourceArt/**/*.png

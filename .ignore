@@ -1,0 +1,10 @@
+/.vs
+/.vscode
+/Content
+/DerivedDataCache
+/Intermediate
+/Saved
+/Plugins/ExamplePlugin/Intermediate
+/Plugins/Niflib/Intermediate
+/Plugins/Niflib/ThirdParty
+/Plugins/Nifly/Intermediate
