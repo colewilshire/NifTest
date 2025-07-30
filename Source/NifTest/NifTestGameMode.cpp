@@ -1,25 +1,18 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
-#include "NifTestActor.h"
+
+#include "NifTestGameMode.h"
 #include "niflib.h"
 #include "obj/NiTriShape.h"
 #include "obj/NiTriStrips.h"
 #include "obj/NiTriShapeData.h"
 #include "obj/NiTriStripsData.h"
 
-// Sets default values
-ANifTestActor::ANifTestActor()
+void ANifTestGameMode::BeginPlay()
 {
- 	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
-	PrimaryActorTick.bCanEverTick = true;
-}
+    Super::BeginPlay();
 
-// Called when the game starts or when spawned
-void ANifTestActor::BeginPlay()
-{
-	Super::BeginPlay();
-
-	// this->PrintVersion();
+    // this->PrintVersion();
     // this->PrintNifObjectType();
     // this->TraverseNifNodes();
 
@@ -28,15 +21,9 @@ void ANifTestActor::BeginPlay()
     this->TraverseNifNodes(root);
 }
 
-// Called every frame
-void ANifTestActor::Tick(float DeltaTime)
+void ANifTestGameMode::PrintVersion()
 {
-	Super::Tick(DeltaTime);
-}
-
-void ANifTestActor::PrintVersion()
-{
-	// Example absolute path - change to your test file
+    // Example absolute path - change to your test file
     FString NifPath = TEXT("E:\\Program Files (x86)\\Steam\\steamapps\\common\\The Guild 2 Renaissance\\Objects\\Animals\\bull.nif");
     std::string NifFilePath = TCHAR_TO_UTF8(*NifPath);
 
@@ -50,7 +37,7 @@ void ANifTestActor::PrintVersion()
     }
 }
 
-void ANifTestActor::PrintNifObjectType()
+void ANifTestGameMode::PrintNifObjectType()
 {
     std::string NifPath = "E:\\Program Files (x86)\\Steam\\steamapps\\common\\The Guild 2 Renaissance\\Objects\\Animals\\bull.nif";
     Niflib::NiObjectRef root = Niflib::ReadNifTree(NifPath);
@@ -60,7 +47,7 @@ void ANifTestActor::PrintNifObjectType()
 
 
 // Helper: Recursively traverse nodes, print mesh info
-void ANifTestActor::TraverseNifNodes(Niflib::NiObjectRef node, int depth)
+void ANifTestGameMode::TraverseNifNodes(Niflib::NiObjectRef node, int depth)
 {
     if (!node) return;
 

@@ -3,26 +3,17 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "GameFramework/Actor.h"
+#include "GameFramework/GameModeBase.h"
 #include "obj/NiNode.h"
-#include "NifTestActor.generated.h"
+#include "NifTestGameMode.generated.h"
 
 UCLASS()
-class NIFTEST_API ANifTestActor : public AActor
+class NIFTEST_API ANifTestGameMode : public AGameModeBase
 {
 	GENERATED_BODY()
-	
-public:	
-	// Sets default values for this actor's properties
-	ANifTestActor();
 
-protected:
-	// Called when the game starts or when spawned
+public:
 	virtual void BeginPlay() override;
-
-public:	
-	// Called every frame
-	virtual void Tick(float DeltaTime) override;
 
 private:
 	//virtual void LoadFile();
