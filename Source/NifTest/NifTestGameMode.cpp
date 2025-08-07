@@ -18,7 +18,10 @@ void ANifTestGameMode::BeginPlay()
 
     std::string NifPath = "E:\\Program Files (x86)\\Steam\\steamapps\\common\\The Guild 2 Renaissance\\Objects\\Animals\\bull.nif";
     Niflib::NiObjectRef root = Niflib::ReadNifTree(NifPath);
-    this->TraverseNifNodes(root);
+    if (root)
+    {
+        this->TraverseNifNodes(root);
+    }
 }
 
 void ANifTestGameMode::PrintVersion()
@@ -45,28 +48,24 @@ void ANifTestGameMode::PrintNifObjectType()
     UE_LOG(LogTemp, Warning, TEXT("Niflib loaded root object of type: %s"), *FString(rootType.c_str()));
 }
 
-
 // Helper: Recursively traverse nodes, print mesh info
 void ANifTestGameMode::TraverseNifNodes(Niflib::NiObjectRef node, int depth)
 {
     if (!node) return;
 
-    // Indent for readability
     std::string indent(depth * 2, ' ');
-
-    // Print node type
     std::string typeName = node->GetType().GetTypeName();
     UE_LOG(LogTemp, Warning, TEXT("%sNode type: %s"), *FString(indent.c_str()), *FString(typeName.c_str()));
 
     // If this is a mesh, get vertex info
     if (Niflib::NiTriShapeRef triShape = Niflib::DynamicCast<Niflib::NiTriShape>(node))
     {
-        // Properly cast GetData() to NiTriShapeDataRef
         Niflib::NiTriShapeDataRef meshData = Niflib::DynamicCast<Niflib::NiTriShapeData>(triShape->GetData());
         if (meshData)
         {
-            const std::vector<Niflib::Vector3>& verts = meshData->GetVertices();
-            const std::vector<Niflib::Triangle>& tris = meshData->GetTriangles();
+            // Make a copy, NOT a reference!
+            std::vector<Niflib::Vector3> verts = meshData->GetVertices();
+            std::vector<Niflib::Triangle> tris = meshData->GetTriangles();
             UE_LOG(LogTemp, Warning, TEXT("%s  [Mesh] NumVerts: %d NumTris: %d"), *FString(indent.c_str()), (int)verts.size(), (int)tris.size());
         }
         else
@@ -76,12 +75,12 @@ void ANifTestGameMode::TraverseNifNodes(Niflib::NiObjectRef node, int depth)
     }
     else if (Niflib::NiTriStripsRef triStrips = Niflib::DynamicCast<Niflib::NiTriStrips>(node))
     {
-        // Properly cast GetData() to NiTriStripsDataRef
         Niflib::NiTriStripsDataRef meshData = Niflib::DynamicCast<Niflib::NiTriStripsData>(triStrips->GetData());
         if (meshData)
         {
-            const std::vector<Niflib::Vector3>& verts = meshData->GetVertices();
-            const std::vector<Niflib::Triangle>& tris = meshData->GetTriangles();
+            // Make a copy, NOT a reference!
+            std::vector<Niflib::Vector3> verts = meshData->GetVertices();
+            std::vector<Niflib::Triangle> tris = meshData->GetTriangles();
             UE_LOG(LogTemp, Warning, TEXT("%s  [Strips] NumVerts: %d NumTris: %d"), *FString(indent.c_str()), (int)verts.size(), (int)tris.size());
         }
         else
