@@ -13,22 +13,13 @@ void ANifTestGameMode::BeginPlay()
 
     // Path to your NIF file (edit as needed)
     std::string NifPath = "E:\\Program Files (x86)\\Steam\\steamapps\\common\\The Guild 2 Renaissance\\Objects\\Animals\\bull.nif";
+
     Niflib::NiObjectRef root;
-    try
+    root = Niflib::ReadNifTree(NifPath);
+    if (!root)
     {
-        root = Niflib::ReadNifTree(NifPath);
-        if (!root)
-        {
-            UE_LOG(LogTemp, Error, TEXT("Niflib: Failed to load NIF file (root is null)!"));
-            return;
-        }
-    }
-    catch (const std::exception& ex)
-    {
-        UE_LOG(LogTemp, Error, TEXT("Niflib: Exception loading NIF: %s"), *FString(ex.what()));
         return;
     }
-
     bSpawnedMesh = false;
     TraverseNifNodes(root);
 }
@@ -139,48 +130,24 @@ void ANifTestGameMode::ShowProceduralMesh(const TArray<FVector>& PositionsIn, co
     UWorld* World = GetWorld();
     if (!World) return;
 
-    // Choose a nonzero spawn location for testing
-    FVector SpawnLocation(0.0f, 0.0f, 0.0f);
-    FActorSpawnParameters SpawnParams;
-    AActor* MeshActor = World->SpawnActor<AActor>(AActor::StaticClass(), SpawnLocation, FRotator::ZeroRotator, SpawnParams);
+    AActor* MeshActor = World->SpawnActor<AActor>(AActor::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator);
 
     if (!MeshActor)
     {
-        UE_LOG(LogTemp, Error, TEXT("Failed to spawn mesh actor!"));
         return;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("Spawned Actor Location: %s"), *MeshActor->GetActorLocation().ToString());
-
-    // Duplicate positions so we can optionally add an offset
     TArray<FVector> Positions = PositionsIn;
 
-    // Optional: Add a test offset to all vertices (comment out if not needed)
-    FVector TestOffset(0.0f, 0.0f, 20.0f); // Add 2000 units Y and Z to mesh geometry
+    FVector SpawnOffset(0.0f, 0.0f, 50.0f);
     for (FVector& V : Positions)
     {
-        V += TestOffset;
+        V += SpawnOffset;
     }
 
-    // Print mesh bounds after offset
-    if (Positions.Num() > 0)
-    {
-        FVector Min = Positions[0], Max = Positions[0];
-        for (const FVector& V : Positions)
-        {
-            Min = Min.ComponentMin(V);
-            Max = Max.ComponentMax(V);
-        }
-        UE_LOG(LogTemp, Warning, TEXT("Mesh Bounds: Min(%f, %f, %f) Max(%f, %f, %f)"), Min.X, Min.Y, Min.Z, Max.X, Max.Y, Max.Z);
-    }
-
-    // Create and register the mesh component, set as root
     UProceduralMeshComponent* PMC = NewObject<UProceduralMeshComponent>(MeshActor);
     MeshActor->SetRootComponent(PMC);
     PMC->RegisterComponent();
-
-    // **Set world location of mesh root to the desired spawn location**
-    PMC->SetWorldLocation(SpawnLocation);
 
     PMC->CreateMeshSection_LinearColor(
         0,
@@ -192,8 +159,4 @@ void ANifTestGameMode::ShowProceduralMesh(const TArray<FVector>& PositionsIn, co
         TArray<FProcMeshTangent>(), // Tangents (optional)
         true                     // Enable collision
     );
-
-    // Log the PMC's location info
-    UE_LOG(LogTemp, Warning, TEXT("PMC RelativeLocation: %s"), *PMC->GetRelativeLocation().ToString());
-    UE_LOG(LogTemp, Warning, TEXT("PMC WorldLocation: %s"), *PMC->GetComponentLocation().ToString());
 }
