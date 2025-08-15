@@ -18,6 +18,6 @@ public:
 
 private:
 	virtual void TraverseNifNodes(Niflib::NiObjectRef node, int depth = 0);
-	virtual  void ShowProceduralMesh(const TArray<FVector>& Positions, const TArray<int32>& Triangles, const TArray<FVector2D>& UVs);
+	virtual void ShowProceduralMesh(const TArray<FVector>& Positions, const TArray<int32>& Triangles, const TArray<FVector2D>& UVs);
 	bool bSpawnedMesh = false;
 };
