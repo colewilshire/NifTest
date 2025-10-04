@@ -17,8 +17,8 @@
 	"Modules": [
 		{
 			"Name": "NiflibPlugin",
-			"Type": "Runtime",
-			"LoadingPhase": "Default"
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
 		}
 	]
 }

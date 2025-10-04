@@ -13,7 +13,19 @@ public class NiflibPlugin : ModuleRules
         PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "inc"));
         PublicAdditionalLibraries.Add(Path.Combine(ModuleDirectory, "lib", "niflib_static.lib"));
 
-        PublicDependencyModuleNames.AddRange(new string[] { "Core" });
-        PrivateDependencyModuleNames.AddRange(new string[] { "CoreUObject", "Engine", "Slate", "SlateCore" });
+        // PublicDependencyModuleNames.AddRange(new string[] { "Core" });
+        // PrivateDependencyModuleNames.AddRange(new string[] { "CoreUObject", "Engine", "Slate", "SlateCore" });
+
+        // Core deps
+        PublicDependencyModuleNames.AddRange(new string[] {
+            "Core", "CoreUObject", "Engine", "Projects"
+        });
+
+        // Editor-only helpers (safe because module Type=Editor)
+        PrivateDependencyModuleNames.AddRange(new string[] {
+            "UnrealEd", "AssetTools", "AssetRegistry", "ContentBrowser",
+            "EditorFramework", "MeshUtilities", "SkeletalMeshUtilitiesCommon",
+            "Slate", "SlateCore", "RenderCore"
+        });
     }
 }
