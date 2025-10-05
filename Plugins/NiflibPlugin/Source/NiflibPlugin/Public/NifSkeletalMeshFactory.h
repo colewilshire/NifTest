@@ -1,7 +1,13 @@
+// NifSkeletalMeshFactory.h
 #pragma once
+
+#include "CoreMinimal.h"
 #include "Factories/Factory.h"
 #include "NifSkeletalMeshFactory.generated.h"
 
+/**
+ * Factory for importing .nif files as Skeletal Meshes
+ */
 UCLASS()
 class UNifSkeletalMeshFactory : public UFactory
 {
@@ -10,6 +16,7 @@ class UNifSkeletalMeshFactory : public UFactory
 public:
     UNifSkeletalMeshFactory();
 
+    // UFactory interface
     virtual bool FactoryCanImport(const FString& Filename) override;
 
     virtual UObject* FactoryCreateFile(
