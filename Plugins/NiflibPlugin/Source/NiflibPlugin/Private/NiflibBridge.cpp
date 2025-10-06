@@ -1,5 +1,3 @@
-// NiflibBridge.cpp
-
 #include "NiflibBridge.h"
 #include "Logging/LogMacros.h"
 
@@ -24,6 +22,7 @@ using namespace Niflib;
 
 namespace
 {
+    // --------- small helpers ---------
     static FORCEINLINE FVector3f ToUE(const Vector3& v)
     {
         return FVector3f((float)v.x, (float)v.y, (float)v.z);
@@ -53,12 +52,109 @@ namespace
         return Xf;
     }
 
+    // ---------- traversal context ----------
     struct FTraversalCtx
     {
         FNifMeshData& Mesh;
         int32 VertexBase = 0;
+
+        // Map by **pointer identity** -> UE bone index (avoids hashing Ref<>)
+        TMap<const void*, int32> NodeToBoneIndex;
+        bool bBonesBuilt = false;
+
+        // Index of the single root we designate in case the NIF has multiple top-level chains
+        int32 PrimaryRootIndex = INDEX_NONE;
     };
 
+    // Recursively ensure a bone exists for Node, creating parent first.
+    // Returns the UE bone index for Node.
+    static int32 EnsureBoneForNode(const NiAVObjectRef& Node, FTraversalCtx& Ctx)
+    {
+        if (!Node) return INDEX_NONE;
+
+        const void* Key = Node.operator->();
+        if (int32* Found = Ctx.NodeToBoneIndex.Find(Key))
+        {
+            return *Found;
+        }
+
+        // Parent-first: create (or get) the parent bone index
+        int32 ParentIdx = INDEX_NONE;
+        if (NiNodeRef P = Node->GetParent())
+        {
+            NiAVObjectRef PAsAV = DynamicCast<NiAVObject>(P);
+            ParentIdx = EnsureBoneForNode(PAsAV, Ctx);
+        }
+        else
+        {
+            // No parent: enforce a single-root skeleton.
+            if (Ctx.PrimaryRootIndex != INDEX_NONE)
+            {
+                // Attach additional roots under the primary root to satisfy bOnlyOneRootAllowed
+                ParentIdx = Ctx.PrimaryRootIndex;
+            }
+        }
+
+        // Create this bone
+        FString BoneName = UTF8_TO_TCHAR(Node->GetName().c_str());
+        if (BoneName.IsEmpty())
+        {
+            BoneName = TEXT("Bone");
+        }
+
+        FNifBone UEbone;
+        UEbone.Name = BoneName;
+        UEbone.ParentIndex = ParentIdx;
+        UEbone.BindPose = LocalToFTransform(Node);
+
+        const int32 NewIdx = Ctx.Mesh.Bones.Add(UEbone);
+
+        // If this is the first-ever bone with INDEX_NONE parent, mark it as the designated root
+        if (ParentIdx == INDEX_NONE && Ctx.PrimaryRootIndex == INDEX_NONE)
+        {
+            Ctx.PrimaryRootIndex = NewIdx;
+        }
+
+        Ctx.NodeToBoneIndex.Add(Key, NewIdx);
+        return NewIdx;
+    }
+
+    // Collect bones from a skin: ensure all skin bones (and their parents) exist, parent-first
+    static void BuildBonesFromSkin(const NiSkinInstanceRef& Skin, FTraversalCtx& Ctx)
+    {
+        if (!Skin) return;
+
+        const std::vector<NiNodeRef> BoneNodes = Skin->GetBones();
+        if (BoneNodes.empty())
+        {
+            return;
+        }
+
+        // If the skin has an explicit skeleton root, ensure it's created first so it becomes the primary root.
+        if (NiNodeRef SkelRoot = Skin->GetSkeletonRoot())
+        {
+            NiAVObjectRef SkelRootAsAV = DynamicCast<NiAVObject>(SkelRoot);
+            if (SkelRootAsAV)
+            {
+                EnsureBoneForNode(SkelRootAsAV, Ctx);
+            }
+        }
+
+        // Ensure every bone (and its parent chain) exists
+        for (const NiNodeRef& B : BoneNodes)
+        {
+            if (!B) continue;
+            NiAVObjectRef BAsAV = DynamicCast<NiAVObject>(B);
+            if (BAsAV)
+            {
+                EnsureBoneForNode(BAsAV, Ctx);
+            }
+        }
+
+        Ctx.bBonesBuilt = true;
+    }
+
+    // Append one geometry's vertices, faces, and influences (if skinned)
     static void AppendGeometry(const NiAVObjectRef& Obj, const FTransform& WorldXf, FTraversalCtx& Ctx)
     {
         NiGeometryRef Geo = DynamicCast<NiGeometry>(Obj);
@@ -70,14 +166,14 @@ namespace
         const int NumVerts = GeoData->GetVertexCount();
         if (NumVerts <= 0) return;
 
+        // Build triangle index list
         TArray<uint32> Indices;
-
         if (NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Obj))
         {
-            NiTriShapeDataRef TriData = DynamicCast<NiTriShapeData>(GeoData);
-            if (TriData)
+            if (NiTriShapeDataRef TriData = DynamicCast<NiTriShapeData>(GeoData))
             {
                 const std::vector<Triangle> tris = TriData->GetTriangles();
+                Indices.Reserve((int32)tris.size() * 3);
                 for (const Triangle& t : tris)
                 {
                     Indices.Add(t.v1); Indices.Add(t.v2); Indices.Add(t.v3);
@@ -86,10 +182,10 @@ namespace
         }
         else if (NiTriStripsRef Strips = DynamicCast<NiTriStrips>(Obj))
         {
-            NiTriStripsDataRef StripsData = DynamicCast<NiTriStripsData>(GeoData);
-            if (StripsData)
+            if (NiTriStripsDataRef StripsData = DynamicCast<NiTriStripsData>(GeoData))
             {
                 const std::vector<Triangle> tris = StripsData->GetTriangles();
+                Indices.Reserve((int32)tris.size() * 3);
                 for (const Triangle& t : tris)
                 {
                     Indices.Add(t.v1); Indices.Add(t.v2); Indices.Add(t.v3);
@@ -99,6 +195,7 @@ namespace
 
         if (Indices.Num() == 0) return;
 
+        // Positions & UVs
         const std::vector<Vector3> Verts = GeoData->GetVertices();
         const int UVSetCount = GeoData->GetUVSetCount();
         std::vector<TexCoord> UV0;
@@ -107,10 +204,52 @@ namespace
             UV0 = GeoData->GetUVSet(0);
         }
 
+        // Skinning
+        NiSkinInstanceRef Skin = Geo->GetSkinInstance();
+        NiSkinDataRef SkinData = Skin ? Skin->GetSkinData() : NiSkinDataRef();
+
+        if (Skin && !Ctx.bBonesBuilt)
+        {
+            BuildBonesFromSkin(Skin, Ctx);
+        }
+
+        TArray<TArray<FNifVertexInfluence>> PerVertInfl;
+        if (Skin && SkinData && Ctx.NodeToBoneIndex.Num() > 0)
+        {
+            PerVertInfl.SetNum(NumVerts);
+            const std::vector<NiNodeRef> BoneNodes = Skin->GetBones();
+
+            for (unsigned int boneIdx = 0; boneIdx < BoneNodes.size(); ++boneIdx)
+            {
+                const NiNodeRef BoneNode = BoneNodes[boneIdx];
+                if (!BoneNode) continue;
+
+                const void* Key = BoneNode.operator->();
+                int32* FoundIndex = Ctx.NodeToBoneIndex.Find(Key);
+                if (!FoundIndex) continue;
+                const int32 UEBoneIndex = *FoundIndex;
+
+                const std::vector<SkinWeight>& Weights = SkinData->GetBoneWeights(boneIdx);
+                for (const SkinWeight& SW : Weights)
+                {
+                    const int v = (int)SW.index;
+                    if (v >= 0 && v < NumVerts && SW.weight > 0.0f)
+                    {
+                        FNifVertexInfluence I;
+                        I.BoneIndex = UEBoneIndex;
+                        I.Weight = (float)SW.weight;
+                        PerVertInfl[v].Add(I);
+                    }
+                }
+            }
+        }
+
+        // Emit vertices
         const int32 Base = Ctx.VertexBase;
         for (int i = 0; i < NumVerts; ++i)
         {
             FNifVertex Vtx;
+
             FVector3f p = ToUE(Verts[i]);
             FVector P3 = FVector(p);
             P3 = WorldXf.TransformPosition(P3);
@@ -121,12 +260,21 @@ namespace
             else
                 Vtx.UV = FVector2f(0, 0);
 
-            FNifVertexInfluence Infl; Infl.BoneIndex = 0; Infl.Weight = 1.0f;
-            Vtx.Influences.Add(Infl);
+            if (PerVertInfl.Num() > 0 && i < PerVertInfl.Num() && PerVertInfl[i].Num() > 0)
+            {
+                Vtx.Influences = MoveTemp(PerVertInfl[i]);
+            }
+            else
+            {
+                FNifVertexInfluence Infl; Infl.BoneIndex = (Ctx.PrimaryRootIndex != INDEX_NONE) ? Ctx.PrimaryRootIndex : 0;
+                Infl.Weight = 1.0f;
+                Vtx.Influences.Add(Infl);
+            }
 
             Ctx.Mesh.Vertices.Add(Vtx);
         }
 
+        // Resolve (or create) a material index for this geom
         int32 MatIndex = 0;
         {
             FString MatName = TEXT("NifMat");
@@ -157,6 +305,7 @@ namespace
             else MatIndex = Found;
         }
 
+        // Emit faces
         for (int32 i = 0; i < Indices.Num(); i += 3)
         {
             FNifFace F;
@@ -170,6 +319,7 @@ namespace
         Ctx.VertexBase += NumVerts;
     }
 
+    // Depth-first traversal
     static void Traverse(const NiAVObjectRef& Obj, const FTransform& ParentXf, FTraversalCtx& Ctx)
     {
         if (!Obj) return;
@@ -204,14 +354,6 @@ namespace FNiflibBridge
         }
 
         OutMesh.Bones.Empty();
-        {
-            FNifBone Root;
-            Root.Name = TEXT("Root");
-            Root.ParentIndex = INDEX_NONE;
-            Root.BindPose = FTransform::Identity;
-            OutMesh.Bones.Add(Root);
-        }
-
         OutMesh.Materials.Empty();
         OutMesh.Vertices.Empty();
         OutMesh.Faces.Empty();
@@ -220,10 +362,21 @@ namespace FNiflibBridge
 
         for (const NiObjectRef& RootObj : Roots)
         {
-            if (NiAVObjectRef RootAV = DynamicCast<NiAVObject>(RootObj)) // Ref<NiAVObject>
+            if (NiAVObjectRef RootAV = DynamicCast<NiAVObject>(RootObj))
             {
-                Traverse(RootAV, FTransform::Identity, Ctx);             // passes a Ref<NiAVObject>
+                Traverse(RootAV, FTransform::Identity, Ctx);
             }
+        }
+
+        if (OutMesh.Bones.Num() == 0)
+        {
+            // Fallback single root if no skin/bones detected
+            FNifBone Root;
+            Root.Name = TEXT("Root");
+            Root.ParentIndex = INDEX_NONE;
+            Root.BindPose = FTransform::Identity;
+            OutMesh.Bones.Add(Root);
+            Ctx.PrimaryRootIndex = 0;
         }
 
         if (OutMesh.Materials.Num() == 0 && OutMesh.Faces.Num() > 0)
@@ -234,8 +387,8 @@ namespace FNiflibBridge
 
         OutAnim.Duration = 0.0f;
 
-        UE_LOG(LogTemp, Log, TEXT("[NIF] Accumulated: Vertices=%d Faces=%d Materials=%d"),
-            OutMesh.Vertices.Num(), OutMesh.Faces.Num(), OutMesh.Materials.Num());
+        UE_LOG(LogTemp, Log, TEXT("[NIF] Accumulated: Vertices=%d Faces=%d Materials=%d Bones=%d (PrimaryRoot=%d)"),
+            OutMesh.Vertices.Num(), OutMesh.Faces.Num(), OutMesh.Materials.Num(), OutMesh.Bones.Num(), Ctx.PrimaryRootIndex);
 
         return OutMesh.Faces.Num() > 0;
     }

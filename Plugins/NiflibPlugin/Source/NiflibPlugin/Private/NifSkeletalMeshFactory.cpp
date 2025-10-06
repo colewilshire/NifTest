@@ -1,24 +1,18 @@
-// NifSkeletalMeshFactory.cpp
-
 #include "NifSkeletalMeshFactory.h"
 #include "NiflibBridge.h"
-
-// Engine / Editor
 #include "Engine/SkeletalMesh.h"
 #include "Animation/Skeleton.h"
 #include "ReferenceSkeleton.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "MeshUtilities.h"
-#include "MeshUtilitiesCommon.h"                 // MeshBuildOptions
-#include "Rendering/SkeletalMeshModel.h"         // FSkeletalMeshModel
-#include "Rendering/SkeletalMeshLODModel.h"      // FSkeletalMeshLODModel
-#include "Materials/Material.h"                  // UMaterial::GetDefaultMaterial
-#include "MaterialDomain.h"                      // MD_Surface
-
-// Import container + helpers (UE5 on your setup)
-#include "Rendering/SkeletalMeshLODImporterData.h"       // FSkeletalMeshImportData + SkeletalMeshImportData::*
-#include "ImportUtils/SkeletalMeshImportUtils.h"         // SkeletalMeshImportUtils::ProcessImportMeshInfluences
+#include "MeshUtilitiesCommon.h"
+#include "Rendering/SkeletalMeshModel.h"
+#include "Rendering/SkeletalMeshLODModel.h"
+#include "Materials/Material.h"
+#include "MaterialDomain.h"
+#include "Rendering/SkeletalMeshLODImporterData.h"
+#include "ImportUtils/SkeletalMeshImportUtils.h"
 
 UNifSkeletalMeshFactory::UNifSkeletalMeshFactory()
 {
