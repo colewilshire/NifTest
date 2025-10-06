@@ -5,7 +5,7 @@
 #include <niflib.h>
 #include <obj/NiObject.h>
 #include <obj/NiNode.h>
-#include <obj/NiLODNode.h>              // <-- added
+#include <obj/NiLODNode.h>
 #include <obj/NiAVObject.h>
 #include <obj/NiGeometry.h>
 #include <obj/NiGeometryData.h>
@@ -25,6 +25,10 @@ using namespace Niflib;
 
 namespace
 {
+    // --------- toggle(s) ---------
+    // Create stub bones for skin weights that reference bones we didn't build (prevents verts collapsing to root).
+    static constexpr bool bCreateStubBonesForUnmappedSkinBones = true;
+
     // --------- small helpers ---------
     static FORCEINLINE FVector3f ToUE(const Vector3& v)
     {
@@ -55,6 +59,18 @@ namespace
         return Xf;
     }
 
+    // Canonicalize a bone name (strip common prefixes like "Game_")
+    static FString CanonName(const FString& In)
+    {
+        FString S = In;
+        if (S.StartsWith(TEXT("Game_"), ESearchCase::CaseSensitive))
+        {
+            S.RightChopInline(5, false);
+        }
+        // add more normalization if needed
+        return S;
+    }
+
     // ---------- traversal context ----------
     struct FTraversalCtx
     {
@@ -66,6 +82,9 @@ namespace
 
         // Secondary map by bone name (helps when Skin bones aren't the same node instances)
         TMap<FString, int32> NameToBoneIndex;
+
+        // Visited geometry (by underlying data) to avoid double-adding the same mesh
+        TSet<const void*> VisitedGeoData;
 
         bool bBonesBuilt = false;
 
@@ -123,8 +142,40 @@ namespace
         }
 
         Ctx.NodeToBoneIndex.Add(Key, NewIdx);
-        // keep a name-based backstop (case-insensitive match later)
+        // keep a name-based backstop (case-insensitive/canonical match later)
         Ctx.NameToBoneIndex.FindOrAdd(UEbone.Name, NewIdx);
+        Ctx.NameToBoneIndex.FindOrAdd(CanonName(UEbone.Name), NewIdx);
+        return NewIdx;
+    }
+
+    // Ensure a bone exists by **name only** (used for stub creation)
+    static int32 EnsureStubBoneByName(const FString& BoneNameRaw, FTraversalCtx& Ctx)
+    {
+        const FString Canon = CanonName(BoneNameRaw);
+
+        if (int32* FoundCanon = Ctx.NameToBoneIndex.Find(Canon))
+        {
+            return *FoundCanon;
+        }
+        if (int32* FoundExact = Ctx.NameToBoneIndex.Find(BoneNameRaw))
+        {
+            return *FoundExact;
+        }
+
+        // Create a stub under the primary root (or as a new root if absent)
+        FNifBone UEbone;
+        UEbone.Name = BoneNameRaw;
+        UEbone.ParentIndex = (Ctx.PrimaryRootIndex != INDEX_NONE) ? Ctx.PrimaryRootIndex : INDEX_NONE;
+        UEbone.BindPose = FTransform::Identity;
+
+        const int32 NewIdx = Ctx.Mesh.Bones.Add(UEbone);
+        if (UEbone.ParentIndex == INDEX_NONE && Ctx.PrimaryRootIndex == INDEX_NONE)
+        {
+            Ctx.PrimaryRootIndex = NewIdx;
+        }
+
+        Ctx.NameToBoneIndex.FindOrAdd(UEbone.Name, NewIdx);
+        Ctx.NameToBoneIndex.FindOrAdd(Canon, NewIdx);
         return NewIdx;
     }
 
@@ -224,6 +275,23 @@ namespace
         NiGeometryRef Geo = DynamicCast<NiGeometry>(Obj);
         if (!Geo) return;
 
+        // Early-out if we've already appended this underlying geometry data
+        if (NiGeometryDataRef GeoData = Geo->GetData())
+        {
+            const void* DataKey = GeoData.operator->();
+            if (Ctx.VisitedGeoData.Contains(DataKey))
+            {
+                UE_LOG(LogTemp, Verbose, TEXT("[NIF] Skipping duplicate geometry data: %s"),
+                    *FString(UTF8_TO_TCHAR(Obj->GetName().c_str())));
+                return;
+            }
+            Ctx.VisitedGeoData.Add(DataKey);
+        }
+        else
+        {
+            return;
+        }
+
         // Skip obvious shadow/LOD proxy meshes by name
         const FString GeoName = UTF8_TO_TCHAR(Obj->GetName().c_str());
         const FString NameLower = GeoName.ToLower();
@@ -272,8 +340,11 @@ namespace
 
         if (Indices.Num() == 0) return;
 
-        // Positions & UVs
+        // Positions, Normals & UVs
         const std::vector<Vector3> Verts = GeoData->GetVertices();
+        const std::vector<Vector3> Normals = GeoData->GetNormals();  // may be empty
+        const bool bHasNormals = !Normals.empty();
+
         const int UVSetCount = GeoData->GetUVSetCount();
         std::vector<TexCoord> UV0;
         if (UVSetCount > 0)
@@ -290,16 +361,19 @@ namespace
             BuildBonesFromSkin(Skin, Ctx);
         }
 
-        // --- Diagnostics + mapping with pointer AND name fallback ---
+        // --- Diagnostics + mapping with pointer/name/canonical fallback ---
         int32 TotalCollectedWeights = 0;
         int32 MissedBoneMapPtr = 0;
-        int32 MissedBoneMapName = 0;
+        int32 MissedNameOrCanon = 0;
+        int32 MissedCanonOnly = 0;
         int32 ZeroInfluenceVertsPreFallback = 0;
         TSet<int32> BonesUsed;
         TArray<int32> PerVertCount;
         PerVertCount.Init(0, NumVerts);
 
         TArray<TArray<FNifVertexInfluence>> PerVertInfl;
+        TArray<FString> UnmappedNames;
+
         if (Skin && SkinData && (Ctx.NodeToBoneIndex.Num() > 0 || Ctx.NameToBoneIndex.Num() > 0))
         {
             PerVertInfl.SetNum(NumVerts);
@@ -320,34 +394,28 @@ namespace
                 else
                 {
                     ++MissedBoneMapPtr;
-                    // 2) Fallback: try by name
+                    // 2) Try exact name
                     const FString BoneName = UTF8_TO_TCHAR(BoneNode->GetName().c_str());
-                    if (!BoneName.IsEmpty())
+                    const FString Canon = CanonName(BoneName);
+
+                    if (int32* FoundByName = Ctx.NameToBoneIndex.Find(BoneName))
                     {
-                        int32* FoundByName = Ctx.NameToBoneIndex.Find(BoneName);
-                        if (!FoundByName)
-                        {
-                            for (const TPair<FString, int32>& Pair : Ctx.NameToBoneIndex)
-                            {
-                                if (Pair.Key.Equals(BoneName, ESearchCase::IgnoreCase))
-                                {
-                                    FoundByName = const_cast<int32*>(&Pair.Value);
-                                    break;
-                                }
-                            }
-                        }
-                        if (FoundByName)
-                        {
-                            UEBoneIndex = *FoundByName;
-                        }
-                        else
-                        {
-                            ++MissedBoneMapName;
-                        }
+                        UEBoneIndex = *FoundByName;
+                    }
+                    else if (int32* FoundByCanon = Ctx.NameToBoneIndex.Find(Canon))
+                    {
+                        UEBoneIndex = *FoundByCanon;
                     }
                     else
                     {
-                        ++MissedBoneMapName;
+                        ++MissedNameOrCanon;
+                        ++MissedCanonOnly;
+                        UnmappedNames.AddUnique(BoneName);
+
+                        if (bCreateStubBonesForUnmappedSkinBones)
+                        {
+                            UEBoneIndex = EnsureStubBoneByName(BoneName, Ctx);
+                        }
                     }
                 }
 
@@ -379,23 +447,20 @@ namespace
                 }
             }
 
-            UE_LOG(LogTemp, Log, TEXT("[NIF][Skin] Geo='%s' Verts=%d  TotalWeights=%d  ZeroInfVerts(pre-fallback)=%d  MissPtr=%d  MissName=%d  BonesUsed=%d"),
+            UE_LOG(LogTemp, Log, TEXT("[NIF][Skin] Geo='%s' Verts=%d  TotalWeights=%d  ZeroInfVerts(pre-fallback)=%d  MissPtr=%d  MissNameOrCanon=%d  MissCanon=%d  BonesUsed=%d"),
                 *GeoName,
                 NumVerts,
                 TotalCollectedWeights,
                 ZeroInfluenceVertsPreFallback,
                 MissedBoneMapPtr,
-                MissedBoneMapName,
+                MissedNameOrCanon,
+                MissedCanonOnly,
                 BonesUsed.Num());
 
-            if (MissedBoneMapPtr > 0 || MissedBoneMapName > 0)
+            if (UnmappedNames.Num() > 0 && !bCreateStubBonesForUnmappedSkinBones)
             {
-                UE_LOG(LogTemp, Warning, TEXT("[NIF][Skin] Bone mapping misses for Geo='%s' (Ptr:%d Name:%d). If weights look missing, name mismatch may be the cause."),
-                    *GeoName, MissedBoneMapPtr, MissedBoneMapName);
-            }
-            if (ZeroInfluenceVertsPreFallback == NumVerts)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("[NIF][Skin] All vertices are unweighted before fallback on Geo='%s'."), *GeoName);
+                UE_LOG(LogTemp, Warning, TEXT("[NIF][Skin] Unmapped skin bones on Geo='%s': %s"),
+                    *GeoName, *FString::Join(UnmappedNames, TEXT(", ")));
             }
         }
         else if (Skin && !SkinData)
@@ -409,22 +474,39 @@ namespace
         {
             FNifVertex Vtx;
 
+            // position
             FVector3f p = ToUE(Verts[i]);
             FVector P3 = FVector(p);
             P3 = WorldXf.TransformPosition(P3);
             Vtx.Position = (FVector3f)P3;
 
+            // normal (if present)
+            if (bHasNormals && i < (int)Normals.size())
+            {
+                FVector3f n = ToUE(Normals[i]);
+                FVector N3 = FVector(n);
+                N3 = WorldXf.TransformVectorNoScale(N3);
+                Vtx.Normal = (FVector3f)N3.GetSafeNormal();
+            }
+            else
+            {
+                Vtx.Normal = FVector3f::ZeroVector; // will trigger recompute on the UE side
+            }
+
+            // UV0
             if (!UV0.empty() && i < (int)UV0.size())
                 Vtx.UV = ToUE(UV0[i]);
             else
                 Vtx.UV = FVector2f(0, 0);
 
+            // influences
             if (PerVertInfl.Num() > 0 && i < PerVertInfl.Num() && PerVertInfl[i].Num() > 0)
             {
                 Vtx.Influences = MoveTemp(PerVertInfl[i]);
             }
             else
             {
+                // ensure everything is weighted
                 FNifVertexInfluence Infl; Infl.BoneIndex = (Ctx.PrimaryRootIndex != INDEX_NONE) ? Ctx.PrimaryRootIndex : 0;
                 Infl.Weight = 1.0f;
                 Vtx.Influences.Add(Infl);
@@ -499,18 +581,16 @@ namespace
         Ctx.VertexBase += NumVerts;
     }
 
-    // Depth-first traversal with LOD handling
+    // Depth-first traversal with LOD handling (highest-detail child of NiLODNode)
     static void Traverse(const NiAVObjectRef& Obj, const FTransform& ParentXf, FTraversalCtx& Ctx)
     {
         if (!Obj) return;
 
-        // If this is an LOD node, pick the highest-detail child and ONLY traverse that.
         if (NiLODNodeRef LOD = DynamicCast<NiLODNode>(Obj))
         {
             const auto& children = LOD->GetChildren();
             if (!children.empty())
             {
-                // Choose the child with the most triangles (best detail).
                 int32 BestIdx = -1;
                 int32 BestTris = -1;
                 for (int32 i = 0; i < (int32)children.size(); ++i)
@@ -522,10 +602,10 @@ namespace
                         BestIdx = i;
                     }
                 }
-                if (BestIdx < 0) BestIdx = 0; // fallback to first
+                if (BestIdx < 0) BestIdx = 0;
                 Traverse(children[BestIdx], ParentXf, Ctx);
             }
-            return; // do not traverse all LOD children
+            return;
         }
 
         FTransform LocalXf = LocalToFTransform(Obj);

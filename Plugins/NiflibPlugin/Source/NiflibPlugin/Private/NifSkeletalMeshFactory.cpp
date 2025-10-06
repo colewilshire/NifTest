@@ -104,6 +104,20 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
         Points.Add(V.Position);
     }
 
+    // Detect whether we actually have imported normals
+    bool bHasImportNormals = false;
+    {
+        for (const FNifVertex& V : Mesh.Vertices)
+        {
+            if (!V.Normal.IsNearlyZero(1e-6f))
+            {
+                bHasImportNormals = true;
+                break;
+            }
+        }
+        UE_LOG(LogTemp, Log, TEXT("[NIF] Imported Normals: %s"), bHasImportNormals ? TEXT("yes") : TEXT("no"));
+    }
+
     // Wedges/Faces
     TArray<FMeshWedge> Wedges;
     Wedges.Reserve(Mesh.Faces.Num() * 3);
@@ -129,7 +143,9 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
             Face.iWedge[c] = (uint32)Wedges.Add(W);
             Face.TangentX[c] = FVector3f::ZeroVector;
             Face.TangentY[c] = FVector3f::ZeroVector;
-            Face.TangentZ[c] = FVector3f::ZeroVector;
+
+            // Use imported normal if present; otherwise leave zero and let UE recompute
+            Face.TangentZ[c] = bHasImportNormals ? V.Normal : FVector3f::ZeroVector;
         }
         Faces.Add(Face);
     }
@@ -227,7 +243,9 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
     SkeletalMesh->AddLODInfo();
     FSkeletalMeshLODInfo* LODInfo = SkeletalMesh->GetLODInfo(0);
     check(LODInfo);
-    LODInfo->BuildSettings.bRecomputeNormals = true;
+
+    // If we have imported normals, tell the builder NOT to recompute them.
+    LODInfo->BuildSettings.bRecomputeNormals = !bHasImportNormals;
     LODInfo->BuildSettings.bRecomputeTangents = true;
     LODInfo->BuildSettings.bUseMikkTSpace = true;
 
@@ -237,7 +255,7 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
     // 6) Build render/CPU LOD data
     IMeshUtilities& MeshUtils = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
     IMeshUtilities::MeshBuildOptions BuildOptions;
-    BuildOptions.bComputeNormals = true;
+    BuildOptions.bComputeNormals = !bHasImportNormals; // match BuildSettings
     BuildOptions.bComputeTangents = true;
     BuildOptions.bUseMikkTSpace = true;
 
@@ -363,8 +381,6 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
                 auto VertexSkinWeights = Attrs.GetVertexSkinWeights();
                 if (VertexSkinWeights.IsValid())
                 {
-                    // Pack to FBoneWeight (BoneIndex + 16-bit weight). Your engine’s FBoneWeight
-                    // doesn’t have Create(), so we quantize ourselves and use the constructor.
                     constexpr float kScale = 65535.0f;
 
                     for (int32 v = 0; v < VertIDs.Num(); ++v)
@@ -380,7 +396,6 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
                             const float Wf = FMath::Clamp(P.Value, 0.f, 1.f);
                             const uint16 W16 = (uint16)FMath::Clamp((int32)FMath::RoundToInt(Wf * kScale), 0, 65535);
 
-                            // NOTE: This ctor signature exists in engine versions that lack FBoneWeight::Create
                             Weights.Emplace((uint16)BoneIdx, W16);
                         }
 
