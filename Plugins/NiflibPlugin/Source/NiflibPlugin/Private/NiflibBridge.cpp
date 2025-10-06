@@ -5,6 +5,7 @@
 #include <niflib.h>
 #include <obj/NiObject.h>
 #include <obj/NiNode.h>
+#include <obj/NiLODNode.h>              // <-- added
 #include <obj/NiAVObject.h>
 #include <obj/NiGeometry.h>
 #include <obj/NiGeometryData.h>
@@ -13,6 +14,8 @@
 #include <obj/NiTriStrips.h>
 #include <obj/NiTriStripsData.h>
 #include <obj/NiMaterialProperty.h>
+#include <obj/NiTexturingProperty.h>
+#include <obj/NiSourceTexture.h>
 #include <gen/enums.h>
 #include <obj/NiSkinInstance.h>
 #include <obj/NiSkinData.h>
@@ -60,6 +63,10 @@ namespace
 
         // Map by **pointer identity** -> UE bone index (avoids hashing Ref<>)
         TMap<const void*, int32> NodeToBoneIndex;
+
+        // Secondary map by bone name (helps when Skin bones aren't the same node instances)
+        TMap<FString, int32> NameToBoneIndex;
+
         bool bBonesBuilt = false;
 
         // Index of the single root we designate in case the NIF has multiple top-level chains
@@ -116,6 +123,8 @@ namespace
         }
 
         Ctx.NodeToBoneIndex.Add(Key, NewIdx);
+        // keep a name-based backstop (case-insensitive match later)
+        Ctx.NameToBoneIndex.FindOrAdd(UEbone.Name, NewIdx);
         return NewIdx;
     }
 
@@ -154,11 +163,79 @@ namespace
         Ctx.bBonesBuilt = true;
     }
 
+    // Try to extract a diffuse texture path from properties on a geometry
+    static FString GetDiffuseTexturePath(const NiGeometryRef& Geo)
+    {
+        if (!Geo) return FString();
+
+        const std::vector<NiPropertyRef> props = Geo->GetProperties();
+        for (const NiPropertyRef& p : props)
+        {
+            if (NiTexturingPropertyRef TP = DynamicCast<NiTexturingProperty>(p))
+            {
+                // BASE map is the diffuse slot
+                if (TP->HasTexture(Niflib::BASE_MAP))
+                {
+                    const TexDesc& Base = TP->GetTexture(Niflib::BASE_MAP);
+                    if (Base.source)
+                    {
+                        const std::string& File = Base.source->GetTextureFileName();
+                        if (!File.empty())
+                        {
+                            return UTF8_TO_TCHAR(File.c_str());
+                        }
+                    }
+                }
+            }
+        }
+        return FString();
+    }
+
+    // Count triangles for a node if it's geometry; used to choose best LOD child
+    static int32 GetTriangleCount(const NiAVObjectRef& Obj)
+    {
+        if (!Obj) return 0;
+        NiGeometryRef Geo = DynamicCast<NiGeometry>(Obj);
+        if (!Geo) return 0;
+
+        NiGeometryDataRef GeoData = Geo->GetData();
+        if (!GeoData) return 0;
+
+        if (NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Obj))
+        {
+            if (NiTriShapeDataRef TriData = DynamicCast<NiTriShapeData>(GeoData))
+            {
+                return (int32)TriData->GetTriangles().size();
+            }
+        }
+        else if (NiTriStripsRef Strips = DynamicCast<NiTriStrips>(Obj))
+        {
+            if (NiTriStripsDataRef StripsData = DynamicCast<NiTriStripsData>(GeoData))
+            {
+                return (int32)StripsData->GetTriangles().size();
+            }
+        }
+        return 0;
+    }
+
     // Append one geometry's vertices, faces, and influences (if skinned)
     static void AppendGeometry(const NiAVObjectRef& Obj, const FTransform& WorldXf, FTraversalCtx& Ctx)
     {
         NiGeometryRef Geo = DynamicCast<NiGeometry>(Obj);
         if (!Geo) return;
+
+        // Skip obvious shadow/LOD proxy meshes by name
+        const FString GeoName = UTF8_TO_TCHAR(Obj->GetName().c_str());
+        const FString NameLower = GeoName.ToLower();
+        const bool bLooksProxy =
+            NameLower.Contains(TEXT("shadow")) ||
+            NameLower.Contains(TEXT("lod")) ||
+            NameLower.Contains(TEXT("low"));
+        if (bLooksProxy)
+        {
+            UE_LOG(LogTemp, Verbose, TEXT("[NIF] Skipping proxy mesh: %s"), *GeoName);
+            return;
+        }
 
         NiGeometryDataRef GeoData = Geo->GetData();
         if (!GeoData) return;
@@ -213,8 +290,17 @@ namespace
             BuildBonesFromSkin(Skin, Ctx);
         }
 
+        // --- Diagnostics + mapping with pointer AND name fallback ---
+        int32 TotalCollectedWeights = 0;
+        int32 MissedBoneMapPtr = 0;
+        int32 MissedBoneMapName = 0;
+        int32 ZeroInfluenceVertsPreFallback = 0;
+        TSet<int32> BonesUsed;
+        TArray<int32> PerVertCount;
+        PerVertCount.Init(0, NumVerts);
+
         TArray<TArray<FNifVertexInfluence>> PerVertInfl;
-        if (Skin && SkinData && Ctx.NodeToBoneIndex.Num() > 0)
+        if (Skin && SkinData && (Ctx.NodeToBoneIndex.Num() > 0 || Ctx.NameToBoneIndex.Num() > 0))
         {
             PerVertInfl.SetNum(NumVerts);
             const std::vector<NiNodeRef> BoneNodes = Skin->GetBones();
@@ -224,10 +310,48 @@ namespace
                 const NiNodeRef BoneNode = BoneNodes[boneIdx];
                 if (!BoneNode) continue;
 
+                // 1) Try pointer identity first
                 const void* Key = BoneNode.operator->();
-                int32* FoundIndex = Ctx.NodeToBoneIndex.Find(Key);
-                if (!FoundIndex) continue;
-                const int32 UEBoneIndex = *FoundIndex;
+                int32 UEBoneIndex = INDEX_NONE;
+                if (int32* FoundByPtr = Ctx.NodeToBoneIndex.Find(Key))
+                {
+                    UEBoneIndex = *FoundByPtr;
+                }
+                else
+                {
+                    ++MissedBoneMapPtr;
+                    // 2) Fallback: try by name
+                    const FString BoneName = UTF8_TO_TCHAR(BoneNode->GetName().c_str());
+                    if (!BoneName.IsEmpty())
+                    {
+                        int32* FoundByName = Ctx.NameToBoneIndex.Find(BoneName);
+                        if (!FoundByName)
+                        {
+                            for (const TPair<FString, int32>& Pair : Ctx.NameToBoneIndex)
+                            {
+                                if (Pair.Key.Equals(BoneName, ESearchCase::IgnoreCase))
+                                {
+                                    FoundByName = const_cast<int32*>(&Pair.Value);
+                                    break;
+                                }
+                            }
+                        }
+                        if (FoundByName)
+                        {
+                            UEBoneIndex = *FoundByName;
+                        }
+                        else
+                        {
+                            ++MissedBoneMapName;
+                        }
+                    }
+                    else
+                    {
+                        ++MissedBoneMapName;
+                    }
+                }
+
+                if (UEBoneIndex == INDEX_NONE) continue;
 
                 const std::vector<SkinWeight>& Weights = SkinData->GetBoneWeights(boneIdx);
                 for (const SkinWeight& SW : Weights)
@@ -239,9 +363,44 @@ namespace
                         I.BoneIndex = UEBoneIndex;
                         I.Weight = (float)SW.weight;
                         PerVertInfl[v].Add(I);
+
+                        ++PerVertCount[v];
+                        ++TotalCollectedWeights;
+                        BonesUsed.Add(UEBoneIndex);
                     }
                 }
             }
+
+            for (int32 vi = 0; vi < NumVerts; ++vi)
+            {
+                if (PerVertCount[vi] == 0)
+                {
+                    ++ZeroInfluenceVertsPreFallback;
+                }
+            }
+
+            UE_LOG(LogTemp, Log, TEXT("[NIF][Skin] Geo='%s' Verts=%d  TotalWeights=%d  ZeroInfVerts(pre-fallback)=%d  MissPtr=%d  MissName=%d  BonesUsed=%d"),
+                *GeoName,
+                NumVerts,
+                TotalCollectedWeights,
+                ZeroInfluenceVertsPreFallback,
+                MissedBoneMapPtr,
+                MissedBoneMapName,
+                BonesUsed.Num());
+
+            if (MissedBoneMapPtr > 0 || MissedBoneMapName > 0)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[NIF][Skin] Bone mapping misses for Geo='%s' (Ptr:%d Name:%d). If weights look missing, name mismatch may be the cause."),
+                    *GeoName, MissedBoneMapPtr, MissedBoneMapName);
+            }
+            if (ZeroInfluenceVertsPreFallback == NumVerts)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[NIF][Skin] All vertices are unweighted before fallback on Geo='%s'."), *GeoName);
+            }
+        }
+        else if (Skin && !SkinData)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[NIF][Skin] Geo='%s' has NiSkinInstance but no NiSkinData."), *GeoName);
         }
 
         // Emit vertices
@@ -291,18 +450,39 @@ namespace
                 }
             }
 
+            // Extract diffuse texture path (if any)
+            const FString DiffusePath = GetDiffuseTexturePath(Geo);
+
             int32 Found = INDEX_NONE;
             for (int32 i = 0; i < Ctx.Mesh.Materials.Num(); ++i)
             {
                 if (Ctx.Mesh.Materials[i].Name == MatName) { Found = i; break; }
             }
+
             if (Found == INDEX_NONE)
             {
-                FNifMaterial NewMat; NewMat.Name = MatName;
+                FNifMaterial NewMat;
+                NewMat.Name = MatName;
+                NewMat.DiffuseTexturePath = DiffusePath;
                 Ctx.Mesh.Materials.Add(NewMat);
                 MatIndex = Ctx.Mesh.Materials.Num() - 1;
             }
-            else MatIndex = Found;
+            else
+            {
+                MatIndex = Found;
+                FNifMaterial& Existing = Ctx.Mesh.Materials[Found];
+                if (Existing.DiffuseTexturePath.IsEmpty() && !DiffusePath.IsEmpty())
+                {
+                    Existing.DiffuseTexturePath = DiffusePath;
+                }
+                else if (!DiffusePath.IsEmpty() && !Existing.DiffuseTexturePath.IsEmpty() &&
+                    !Existing.DiffuseTexturePath.Equals(DiffusePath, ESearchCase::IgnoreCase))
+                {
+                    UE_LOG(LogTemp, Warning,
+                        TEXT("[NIF] Material '%s' appears with different diffuse textures: '%s' vs '%s'"),
+                        *MatName, *Existing.DiffuseTexturePath, *DiffusePath);
+                }
+            }
         }
 
         // Emit faces
@@ -319,10 +499,35 @@ namespace
         Ctx.VertexBase += NumVerts;
     }
 
-    // Depth-first traversal
+    // Depth-first traversal with LOD handling
     static void Traverse(const NiAVObjectRef& Obj, const FTransform& ParentXf, FTraversalCtx& Ctx)
     {
         if (!Obj) return;
+
+        // If this is an LOD node, pick the highest-detail child and ONLY traverse that.
+        if (NiLODNodeRef LOD = DynamicCast<NiLODNode>(Obj))
+        {
+            const auto& children = LOD->GetChildren();
+            if (!children.empty())
+            {
+                // Choose the child with the most triangles (best detail).
+                int32 BestIdx = -1;
+                int32 BestTris = -1;
+                for (int32 i = 0; i < (int32)children.size(); ++i)
+                {
+                    const int32 TriCount = GetTriangleCount(children[i]);
+                    if (TriCount > BestTris)
+                    {
+                        BestTris = TriCount;
+                        BestIdx = i;
+                    }
+                }
+                if (BestIdx < 0) BestIdx = 0; // fallback to first
+                Traverse(children[BestIdx], ParentXf, Ctx);
+            }
+            return; // do not traverse all LOD children
+        }
+
         FTransform LocalXf = LocalToFTransform(Obj);
         FTransform WorldXf = LocalXf * ParentXf;
 
@@ -389,6 +594,13 @@ namespace FNiflibBridge
 
         UE_LOG(LogTemp, Log, TEXT("[NIF] Accumulated: Vertices=%d Faces=%d Materials=%d Bones=%d (PrimaryRoot=%d)"),
             OutMesh.Vertices.Num(), OutMesh.Faces.Num(), OutMesh.Materials.Num(), OutMesh.Bones.Num(), Ctx.PrimaryRootIndex);
+
+        // Optional: print material-to-texture mapping for verification
+        for (int32 i = 0; i < OutMesh.Materials.Num(); ++i)
+        {
+            const auto& M = OutMesh.Materials[i];
+            UE_LOG(LogTemp, Log, TEXT("[NIF] Material[%d] '%s' Diffuse='%s'"), i, *M.Name, *M.DiffuseTexturePath);
+        }
 
         return OutMesh.Faces.Num() > 0;
     }

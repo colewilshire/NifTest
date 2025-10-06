@@ -5,8 +5,8 @@ using UnrealBuildTool;
 
 public class NiflibPlugin : ModuleRules
 {
-	public NiflibPlugin(ReadOnlyTargetRules Target) : base(Target)
-	{
+    public NiflibPlugin(ReadOnlyTargetRules Target) : base(Target)
+    {
         PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 
         PublicDefinitions.Add("NIFLIB_STATIC_LINK=1");
@@ -17,15 +17,35 @@ public class NiflibPlugin : ModuleRules
         // PrivateDependencyModuleNames.AddRange(new string[] { "CoreUObject", "Engine", "Slate", "SlateCore" });
 
         // Core deps
+        //PublicDependencyModuleNames.AddRange(new string[] {
+        //    "Core", "CoreUObject", "Engine", "Projects"
+        //});
+
+        //// Editor-only helpers (safe because module Type=Editor)
+        //PrivateDependencyModuleNames.AddRange(new string[] {
+        //    "UnrealEd", "AssetTools", "AssetRegistry", "ContentBrowser",
+        //    "EditorFramework", "MeshUtilities", "SkeletalMeshUtilitiesCommon",
+        //    "Slate", "SlateCore", "RenderCore"
+        //});
+
         PublicDependencyModuleNames.AddRange(new string[] {
-            "Core", "CoreUObject", "Engine", "Projects"
+            "Core", "CoreUObject", "Engine",
+            "AssetTools", "MeshUtilities", "RenderCore"
         });
 
-        // Editor-only helpers (safe because module Type=Editor)
         PrivateDependencyModuleNames.AddRange(new string[] {
-            "UnrealEd", "AssetTools", "AssetRegistry", "ContentBrowser",
-            "EditorFramework", "MeshUtilities", "SkeletalMeshUtilitiesCommon",
-            "Slate", "SlateCore", "RenderCore"
+            "UnrealEd",                 // factories / editor-only helpers
+            "MeshDescription",          // FMeshDescription & CreateVertexInstance_Internal
+            "SkeletalMeshDescription",  // FSkeletalMeshAttributes
+            "StaticMeshDescription",    // (often pulled in transitively; safe to add)
+            "Slate", "SlateCore"
         });
+
+        if (Target.bBuildEditor)
+        {
+            PrivateDependencyModuleNames.AddRange(new string[] {
+                "EditorFramework", "EditorSubsystem", "Persona"
+            });
+        }
     }
 }
