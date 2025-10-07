@@ -397,5 +397,8 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
     UE_LOG(LogTemp, Log, TEXT("[NIF] Imported SkeletalMesh %s  (LODs: %d)"),
         *MeshObjName, SkeletalMesh->GetImportedModel()->LODModels.Num());
 
+    // Force reload to auto-generate missing MeshDescription
+    SkeletalMesh->PostLoad();
+
     return SkeletalMesh;
 }
