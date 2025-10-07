@@ -69,4 +69,5 @@ namespace FNiflibBridge
 {
 	/** Parse a .nif into simple structs (UE-space, units fixed). Return false to cancel import. */
 	bool ParseNifFile(const FString& Path, FNifMeshData& OutMesh, FNifAnimationData& OutAnim);
+	bool ParseNifFileWithLOD(const FString& Path, int32 RequestedLOD, FNifMeshData& OutMesh, FNifAnimationData& OutAnim);
 }

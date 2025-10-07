@@ -26,7 +26,6 @@ using namespace Niflib;
 namespace
 {
     // --------- toggle(s) ---------
-    // Create stub bones for skin weights that reference bones we didn't build (prevents verts collapsing to root).
     static constexpr bool bCreateStubBonesForUnmappedSkinBones = true;
 
     // --------- small helpers ---------
@@ -59,7 +58,6 @@ namespace
         return Xf;
     }
 
-    // Canonicalize a bone name (strip common prefixes like "Game_")
     static FString CanonName(const FString& In)
     {
         FString S = In;
@@ -67,7 +65,6 @@ namespace
         {
             S.RightChopInline(5, false);
         }
-        // add more normalization if needed
         return S;
     }
 
@@ -77,23 +74,23 @@ namespace
         FNifMeshData& Mesh;
         int32 VertexBase = 0;
 
-        // Map by **pointer identity** -> UE bone index (avoids hashing Ref<>)
+        // Map by **pointer identity** -> UE bone index
         TMap<const void*, int32> NodeToBoneIndex;
 
-        // Secondary map by bone name (helps when Skin bones aren't the same node instances)
+        // Secondary map by bone name
         TMap<FString, int32> NameToBoneIndex;
 
-        // Visited geometry (by underlying data) to avoid double-adding the same mesh
+        // Visited geometry (by underlying data)
         TSet<const void*> VisitedGeoData;
 
         bool bBonesBuilt = false;
 
-        // Index of the single root we designate in case the NIF has multiple top-level chains
+        // LOD selection: -1 = auto/highest (legacy), >=0 = specific LOD child index
+        int32 RequestedLOD = -1;
+
         int32 PrimaryRootIndex = INDEX_NONE;
     };
 
-    // Recursively ensure a bone exists for Node, creating parent first.
-    // Returns the UE bone index for Node.
     static int32 EnsureBoneForNode(const NiAVObjectRef& Node, FTraversalCtx& Ctx)
     {
         if (!Node) return INDEX_NONE;
@@ -104,7 +101,6 @@ namespace
             return *Found;
         }
 
-        // Parent-first: create (or get) the parent bone index
         int32 ParentIdx = INDEX_NONE;
         if (NiNodeRef P = Node->GetParent())
         {
@@ -113,15 +109,12 @@ namespace
         }
         else
         {
-            // No parent: enforce a single-root skeleton.
             if (Ctx.PrimaryRootIndex != INDEX_NONE)
             {
-                // Attach additional roots under the primary root to satisfy bOnlyOneRootAllowed
                 ParentIdx = Ctx.PrimaryRootIndex;
             }
         }
 
-        // Create this bone
         FString BoneName = UTF8_TO_TCHAR(Node->GetName().c_str());
         if (BoneName.IsEmpty())
         {
@@ -135,20 +128,17 @@ namespace
 
         const int32 NewIdx = Ctx.Mesh.Bones.Add(UEbone);
 
-        // If this is the first-ever bone with INDEX_NONE parent, mark it as the designated root
         if (ParentIdx == INDEX_NONE && Ctx.PrimaryRootIndex == INDEX_NONE)
         {
             Ctx.PrimaryRootIndex = NewIdx;
         }
 
         Ctx.NodeToBoneIndex.Add(Key, NewIdx);
-        // keep a name-based backstop (case-insensitive/canonical match later)
         Ctx.NameToBoneIndex.FindOrAdd(UEbone.Name, NewIdx);
         Ctx.NameToBoneIndex.FindOrAdd(CanonName(UEbone.Name), NewIdx);
         return NewIdx;
     }
 
-    // Ensure a bone exists by **name only** (used for stub creation)
     static int32 EnsureStubBoneByName(const FString& BoneNameRaw, FTraversalCtx& Ctx)
     {
         const FString Canon = CanonName(BoneNameRaw);
@@ -162,7 +152,6 @@ namespace
             return *FoundExact;
         }
 
-        // Create a stub under the primary root (or as a new root if absent)
         FNifBone UEbone;
         UEbone.Name = BoneNameRaw;
         UEbone.ParentIndex = (Ctx.PrimaryRootIndex != INDEX_NONE) ? Ctx.PrimaryRootIndex : INDEX_NONE;
@@ -179,7 +168,6 @@ namespace
         return NewIdx;
     }
 
-    // Collect bones from a skin: ensure all skin bones (and their parents) exist, parent-first
     static void BuildBonesFromSkin(const NiSkinInstanceRef& Skin, FTraversalCtx& Ctx)
     {
         if (!Skin) return;
@@ -190,7 +178,6 @@ namespace
             return;
         }
 
-        // If the skin has an explicit skeleton root, ensure it's created first so it becomes the primary root.
         if (NiNodeRef SkelRoot = Skin->GetSkeletonRoot())
         {
             NiAVObjectRef SkelRootAsAV = DynamicCast<NiAVObject>(SkelRoot);
@@ -200,7 +187,6 @@ namespace
             }
         }
 
-        // Ensure every bone (and its parent chain) exists
         for (const NiNodeRef& B : BoneNodes)
         {
             if (!B) continue;
@@ -214,7 +200,6 @@ namespace
         Ctx.bBonesBuilt = true;
     }
 
-    // Try to extract a diffuse texture path from properties on a geometry
     static FString GetDiffuseTexturePath(const NiGeometryRef& Geo)
     {
         if (!Geo) return FString();
@@ -224,7 +209,6 @@ namespace
         {
             if (NiTexturingPropertyRef TP = DynamicCast<NiTexturingProperty>(p))
             {
-                // BASE map is the diffuse slot
                 if (TP->HasTexture(Niflib::BASE_MAP))
                 {
                     const TexDesc& Base = TP->GetTexture(Niflib::BASE_MAP);
@@ -242,7 +226,6 @@ namespace
         return FString();
     }
 
-    // Count triangles for a node if it's geometry; used to choose best LOD child
     static int32 GetTriangleCount(const NiAVObjectRef& Obj)
     {
         if (!Obj) return 0;
@@ -269,13 +252,11 @@ namespace
         return 0;
     }
 
-    // Append one geometry's vertices, faces, and influences (if skinned)
     static void AppendGeometry(const NiAVObjectRef& Obj, const FTransform& WorldXf, FTraversalCtx& Ctx)
     {
         NiGeometryRef Geo = DynamicCast<NiGeometry>(Obj);
         if (!Geo) return;
 
-        // Early-out if we've already appended this underlying geometry data
         if (NiGeometryDataRef GeoData = Geo->GetData())
         {
             const void* DataKey = GeoData.operator->();
@@ -292,7 +273,6 @@ namespace
             return;
         }
 
-        // Skip obvious shadow/LOD proxy meshes by name
         const FString GeoName = UTF8_TO_TCHAR(Obj->GetName().c_str());
         const FString NameLower = GeoName.ToLower();
         const bool bLooksProxy =
@@ -311,7 +291,6 @@ namespace
         const int NumVerts = GeoData->GetVertexCount();
         if (NumVerts <= 0) return;
 
-        // Build triangle index list
         TArray<uint32> Indices;
         if (NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Obj))
         {
@@ -340,9 +319,8 @@ namespace
 
         if (Indices.Num() == 0) return;
 
-        // Positions, Normals & UVs
         const std::vector<Vector3> Verts = GeoData->GetVertices();
-        const std::vector<Vector3> Normals = GeoData->GetNormals();  // may be empty
+        const std::vector<Vector3> Normals = GeoData->GetNormals();
         const bool bHasNormals = !Normals.empty();
 
         const int UVSetCount = GeoData->GetUVSetCount();
@@ -352,7 +330,6 @@ namespace
             UV0 = GeoData->GetUVSet(0);
         }
 
-        // Skinning
         NiSkinInstanceRef Skin = Geo->GetSkinInstance();
         NiSkinDataRef SkinData = Skin ? Skin->GetSkinData() : NiSkinDataRef();
 
@@ -361,7 +338,6 @@ namespace
             BuildBonesFromSkin(Skin, Ctx);
         }
 
-        // --- Diagnostics + mapping with pointer/name/canonical fallback ---
         int32 TotalCollectedWeights = 0;
         int32 MissedBoneMapPtr = 0;
         int32 MissedNameOrCanon = 0;
@@ -384,7 +360,6 @@ namespace
                 const NiNodeRef BoneNode = BoneNodes[boneIdx];
                 if (!BoneNode) continue;
 
-                // 1) Try pointer identity first
                 const void* Key = BoneNode.operator->();
                 int32 UEBoneIndex = INDEX_NONE;
                 if (int32* FoundByPtr = Ctx.NodeToBoneIndex.Find(Key))
@@ -394,7 +369,6 @@ namespace
                 else
                 {
                     ++MissedBoneMapPtr;
-                    // 2) Try exact name
                     const FString BoneName = UTF8_TO_TCHAR(BoneNode->GetName().c_str());
                     const FString Canon = CanonName(BoneName);
 
@@ -468,19 +442,16 @@ namespace
             UE_LOG(LogTemp, Warning, TEXT("[NIF][Skin] Geo='%s' has NiSkinInstance but no NiSkinData."), *GeoName);
         }
 
-        // Emit vertices
         const int32 Base = Ctx.VertexBase;
         for (int i = 0; i < NumVerts; ++i)
         {
             FNifVertex Vtx;
 
-            // position
             FVector3f p = ToUE(Verts[i]);
             FVector P3 = FVector(p);
             P3 = WorldXf.TransformPosition(P3);
             Vtx.Position = (FVector3f)P3;
 
-            // normal (if present)
             if (bHasNormals && i < (int)Normals.size())
             {
                 FVector3f n = ToUE(Normals[i]);
@@ -490,23 +461,20 @@ namespace
             }
             else
             {
-                Vtx.Normal = FVector3f::ZeroVector; // will trigger recompute on the UE side
+                Vtx.Normal = FVector3f::ZeroVector;
             }
 
-            // UV0
             if (!UV0.empty() && i < (int)UV0.size())
                 Vtx.UV = ToUE(UV0[i]);
             else
                 Vtx.UV = FVector2f(0, 0);
 
-            // influences
             if (PerVertInfl.Num() > 0 && i < PerVertInfl.Num() && PerVertInfl[i].Num() > 0)
             {
                 Vtx.Influences = MoveTemp(PerVertInfl[i]);
             }
             else
             {
-                // ensure everything is weighted
                 FNifVertexInfluence Infl; Infl.BoneIndex = (Ctx.PrimaryRootIndex != INDEX_NONE) ? Ctx.PrimaryRootIndex : 0;
                 Infl.Weight = 1.0f;
                 Vtx.Influences.Add(Infl);
@@ -515,7 +483,6 @@ namespace
             Ctx.Mesh.Vertices.Add(Vtx);
         }
 
-        // Resolve (or create) a material index for this geom
         int32 MatIndex = 0;
         {
             FString MatName = TEXT("NifMat");
@@ -532,7 +499,6 @@ namespace
                 }
             }
 
-            // Extract diffuse texture path (if any)
             const FString DiffusePath = GetDiffuseTexturePath(Geo);
 
             int32 Found = INDEX_NONE;
@@ -581,7 +547,7 @@ namespace
         Ctx.VertexBase += NumVerts;
     }
 
-    // Depth-first traversal with LOD handling (highest-detail child of NiLODNode)
+    // Depth-first traversal with LOD selection
     static void Traverse(const NiAVObjectRef& Obj, const FTransform& ParentXf, FTraversalCtx& Ctx)
     {
         if (!Obj) return;
@@ -591,19 +557,28 @@ namespace
             const auto& children = LOD->GetChildren();
             if (!children.empty())
             {
-                int32 BestIdx = -1;
-                int32 BestTris = -1;
-                for (int32 i = 0; i < (int32)children.size(); ++i)
+                if (Ctx.RequestedLOD >= 0 && Ctx.RequestedLOD < (int32)children.size())
                 {
-                    const int32 TriCount = GetTriangleCount(children[i]);
-                    if (TriCount > BestTris)
-                    {
-                        BestTris = TriCount;
-                        BestIdx = i;
-                    }
+                    // Build ONLY the requested LOD child
+                    Traverse(children[Ctx.RequestedLOD], ParentXf, Ctx);
                 }
-                if (BestIdx < 0) BestIdx = 0;
-                Traverse(children[BestIdx], ParentXf, Ctx);
+                else
+                {
+                    // Legacy behavior: pick the highest-detail child
+                    int32 BestIdx = -1;
+                    int32 BestTris = -1;
+                    for (int32 i = 0; i < (int32)children.size(); ++i)
+                    {
+                        const int32 TriCount = GetTriangleCount(children[i]);
+                        if (TriCount > BestTris)
+                        {
+                            BestTris = TriCount;
+                            BestIdx = i;
+                        }
+                    }
+                    if (BestIdx < 0) BestIdx = 0;
+                    Traverse(children[BestIdx], ParentXf, Ctx);
+                }
             }
             return;
         }
@@ -626,9 +601,10 @@ namespace
 
 namespace FNiflibBridge
 {
-    bool ParseNifFile(const FString& Path, FNifMeshData& OutMesh, FNifAnimationData& OutAnim)
+    // New: explicit LOD selector (-1 = auto/highest)
+    bool ParseNifFileWithLOD(const FString& Path, int32 RequestedLOD, FNifMeshData& OutMesh, FNifAnimationData& OutAnim)
     {
-        UE_LOG(LogTemp, Log, TEXT("ParseNifFile: %s"), *Path);
+        UE_LOG(LogTemp, Log, TEXT("ParseNifFile: %s (RequestedLOD=%d)"), *Path, RequestedLOD);
 
         std::string NativePath = TCHAR_TO_UTF8(*Path);
         NifInfo info;
@@ -644,6 +620,7 @@ namespace FNiflibBridge
         OutMesh.Faces.Empty();
 
         FTraversalCtx Ctx{ OutMesh };
+        Ctx.RequestedLOD = RequestedLOD;
 
         for (const NiObjectRef& RootObj : Roots)
         {
@@ -655,7 +632,6 @@ namespace FNiflibBridge
 
         if (OutMesh.Bones.Num() == 0)
         {
-            // Fallback single root if no skin/bones detected
             FNifBone Root;
             Root.Name = TEXT("Root");
             Root.ParentIndex = INDEX_NONE;
@@ -675,7 +651,6 @@ namespace FNiflibBridge
         UE_LOG(LogTemp, Log, TEXT("[NIF] Accumulated: Vertices=%d Faces=%d Materials=%d Bones=%d (PrimaryRoot=%d)"),
             OutMesh.Vertices.Num(), OutMesh.Faces.Num(), OutMesh.Materials.Num(), OutMesh.Bones.Num(), Ctx.PrimaryRootIndex);
 
-        // Optional: print material-to-texture mapping for verification
         for (int32 i = 0; i < OutMesh.Materials.Num(); ++i)
         {
             const auto& M = OutMesh.Materials[i];
@@ -683,5 +658,11 @@ namespace FNiflibBridge
         }
 
         return OutMesh.Faces.Num() > 0;
+    }
+
+    // Back-compat: legacy call = “pick highest detail”
+    bool ParseNifFile(const FString& Path, FNifMeshData& OutMesh, FNifAnimationData& OutAnim)
+    {
+        return ParseNifFileWithLOD(Path, -1, OutMesh, OutAnim);
     }
 }

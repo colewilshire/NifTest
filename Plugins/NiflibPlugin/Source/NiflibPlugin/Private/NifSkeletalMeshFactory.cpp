@@ -1,4 +1,4 @@
-#include "NifSkeletalMeshFactory.h"
+﻿#include "NifSkeletalMeshFactory.h"
 #include "NiflibBridge.h"
 #include "Engine/SkeletalMesh.h"
 #include "Animation/Skeleton.h"
@@ -38,84 +38,26 @@ static UPackage* MakeAssetPackage(const FString& BasePath, const FString& AssetN
     return CreatePackage(*PackageName);
 }
 
-UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
-    UClass* InClass,
-    UObject* InParent,
-    FName InName,
-    EObjectFlags Flags,
-    const FString& Filename,
-    const TCHAR* Parms,
-    FFeedbackContext* Warn,
-    bool& bOutOperationCanceled)
+// Small helper to build one LOD from FNifMeshData into the SkeletalMesh
+static bool BuildOneLOD(
+    int32 LODIndex,
+    const FNifMeshData& Mesh,
+    USkeletalMesh* SkeletalMesh,
+    const FReferenceSkeleton& RefSkeleton,
+    bool& bOutHasImportNormals)
 {
-    UE_LOG(LogTemp, Log, TEXT("[NIF] Importing %s"), *Filename);
-
-    // 1) Parse NIF -> intermediate structs
-    FNifMeshData Mesh;
-    FNifAnimationData Anim;
-    if (!FNiflibBridge::ParseNifFile(Filename, Mesh, Anim))
-    {
-        UE_LOG(LogTemp, Error, TEXT("[NIF] Parse failed: %s"), *Filename);
-        bOutOperationCanceled = true;
-        return nullptr;
-    }
-
-    UE_LOG(LogTemp, Log, TEXT("[NIF] Raw counts: Bones=%d, Vertices=%d, Faces=%d, Materials=%d"),
-        Mesh.Bones.Num(), Mesh.Vertices.Num(), Mesh.Faces.Num(), Mesh.Materials.Num());
-
-    // 2) Create packages/assets
-    const FString BasePath = InParent->GetOutermost()->GetName();
-
-    FString SkelObjName, MeshObjName;
-    UPackage* SkelPkg = MakeAssetPackage(BasePath, InName.ToString() + TEXT("_Skeleton"), SkelObjName);
-    UPackage* MeshPkg = MakeAssetPackage(BasePath, InName.ToString(), MeshObjName);
-
-    USkeleton* Skeleton = NewObject<USkeleton>(SkelPkg, *SkelObjName, RF_Public | RF_Standalone);
-    USkeletalMesh* SkeletalMesh = NewObject<USkeletalMesh>(MeshPkg, *MeshObjName, RF_Public | RF_Standalone);
-    SkeletalMesh->SetSkeleton(Skeleton);
-
-    // 3) Reference skeleton
-    FReferenceSkeleton RefSkeleton(true);
-    {
-        FReferenceSkeletonModifier Mod(RefSkeleton, nullptr);
-        for (int32 i = 0; i < Mesh.Bones.Num(); ++i)
-        {
-            const FNifBone& B = Mesh.Bones[i];
-            const int32 ParentIndex = FMath::Max(-1, B.ParentIndex);
-
-#if WITH_EDITORONLY_DATA
-            FMeshBoneInfo BoneInfo(*B.Name, B.Name, ParentIndex);
-#else
-            FMeshBoneInfo BoneInfo(*B.Name, FString(), ParentIndex);
-#endif
-            Mod.Add(BoneInfo, FTransform(B.BindPose), false);
-        }
-    }
-    SkeletalMesh->SetRefSkeleton(RefSkeleton);
-
-    // 4) Build import arrays
     using namespace SkeletalMeshImportData;
 
     // Points
     TArray<FVector3f> Points;
     Points.Reserve(Mesh.Vertices.Num());
+    bOutHasImportNormals = false;
+
     for (const FNifVertex& V : Mesh.Vertices)
     {
         Points.Add(V.Position);
-    }
-
-    // Detect whether we actually have imported normals
-    bool bHasImportNormals = false;
-    {
-        for (const FNifVertex& V : Mesh.Vertices)
-        {
-            if (!V.Normal.IsNearlyZero(1e-6f))
-            {
-                bHasImportNormals = true;
-                break;
-            }
-        }
-        UE_LOG(LogTemp, Log, TEXT("[NIF] Imported Normals: %s"), bHasImportNormals ? TEXT("yes") : TEXT("no"));
+        if (!bOutHasImportNormals && !V.Normal.IsNearlyZero(1e-6f))
+            bOutHasImportNormals = true;
     }
 
     // Wedges/Faces
@@ -143,9 +85,7 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
             Face.iWedge[c] = (uint32)Wedges.Add(W);
             Face.TangentX[c] = FVector3f::ZeroVector;
             Face.TangentY[c] = FVector3f::ZeroVector;
-
-            // Use imported normal if present; otherwise leave zero and let UE recompute
-            Face.TangentZ[c] = bHasImportNormals ? V.Normal : FVector3f::ZeroVector;
+            Face.TangentZ[c] = bOutHasImportNormals ? V.Normal : FVector3f::ZeroVector;
         }
         Faces.Add(Face);
     }
@@ -166,8 +106,8 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
         }
     }
 
-    UE_LOG(LogTemp, Log, TEXT("[NIF] Pre-normalization: Wedges=%d, Faces=%d, Influences=%d"),
-        Wedges.Num(), Faces.Num(), Influences.Num());
+    UE_LOG(LogTemp, Log, TEXT("[NIF] LOD%d Pre-normalization: Wedges=%d, Faces=%d, Influences=%d"),
+        LODIndex, Wedges.Num(), Faces.Num(), Influences.Num());
 
     // Normalize influences (engine utility)
     int32 ZeroInfluenceVertexCount = 0;
@@ -205,10 +145,10 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
         }
     }
 
-    UE_LOG(LogTemp, Log, TEXT("[NIF] Post-normalization: Influences=%d, ZeroInfluenceVerts=%d"),
-        Influences.Num(), ZeroInfluenceVertexCount);
+    UE_LOG(LogTemp, Log, TEXT("[NIF] LOD%d Post-normalization: Influences=%d, ZeroInfluenceVerts=%d"),
+        LODIndex, Influences.Num(), ZeroInfluenceVertexCount);
 
-    // Validate influences (unsigned bounds checks)
+    // Validate influences
     {
         const uint32 NumPointsU = static_cast<uint32>(Points.Num());
         const uint32 NumBonesU = static_cast<uint32>(RefSkeleton.GetRawBoneNum());
@@ -216,11 +156,9 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
         for (int32 i = Influences.Num() - 1; i >= 0; --i)
         {
             const FVertInfluence& I = Influences[i];
-
             const bool bBadVert = (static_cast<uint32>(I.VertIndex) >= NumPointsU);
             const bool bBadBone = (static_cast<uint32>(I.BoneIndex) >= NumBonesU);
             const bool bBadW = (!FMath::IsFinite(I.Weight) || I.Weight <= 0.f);
-
             if (bBadVert || bBadBone || bBadW)
             {
                 Influences.RemoveAtSwap(i, 1, false);
@@ -234,28 +172,31 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
     for (int32 i = 0; i < Points.Num(); ++i)
         PointToOriginalMap.Add(i);
 
-    // 5) LOD0 (render data)
-    FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
-    check(ImportedModel);
-    ImportedModel->LODModels.Empty();
-
-    SkeletalMesh->GetLODInfoArray().Empty();
-    SkeletalMesh->AddLODInfo();
-    FSkeletalMeshLODInfo* LODInfo = SkeletalMesh->GetLODInfo(0);
+    // Ensure LODInfo entry exists
+    while (SkeletalMesh->GetLODNum() <= LODIndex)
+    {
+        SkeletalMesh->AddLODInfo();
+    }
+    FSkeletalMeshLODInfo* LODInfo = SkeletalMesh->GetLODInfo(LODIndex);
     check(LODInfo);
 
-    // If we have imported normals, tell the builder NOT to recompute them.
-    LODInfo->BuildSettings.bRecomputeNormals = !bHasImportNormals;
+    // Build settings
+    LODInfo->BuildSettings.bRecomputeNormals = !bOutHasImportNormals;
     LODInfo->BuildSettings.bRecomputeTangents = true;
     LODInfo->BuildSettings.bUseMikkTSpace = true;
 
-    FSkeletalMeshLODModel* NewLODModel = new FSkeletalMeshLODModel();
-    ImportedModel->LODModels.Add(NewLODModel);
+    FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
+    check(ImportedModel);
+    while (ImportedModel->LODModels.Num() <= LODIndex)
+    {
+        ImportedModel->LODModels.Add(new FSkeletalMeshLODModel());
+    }
+    FSkeletalMeshLODModel* NewLODModel = &ImportedModel->LODModels[LODIndex];
 
-    // 6) Build render/CPU LOD data
+    // Build render/CPU LOD data
     IMeshUtilities& MeshUtils = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
     IMeshUtilities::MeshBuildOptions BuildOptions;
-    BuildOptions.bComputeNormals = !bHasImportNormals; // match BuildSettings
+    BuildOptions.bComputeNormals = !bOutHasImportNormals;
     BuildOptions.bComputeTangents = true;
     BuildOptions.bUseMikkTSpace = true;
 
@@ -277,140 +218,27 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
     );
 
     for (const FText& W : WarningMsgs)
-        UE_LOG(LogTemp, Warning, TEXT("[NIF] %s"), *W.ToString());
+        UE_LOG(LogTemp, Warning, TEXT("[NIF] LOD%d %s"), LODIndex, *W.ToString());
 
     if (!bBuilt)
     {
-        UE_LOG(LogTemp, Error, TEXT("[NIF] Skeletal mesh build failed."));
-        bOutOperationCanceled = true;
-        return nullptr;
+        UE_LOG(LogTemp, Error, TEXT("[NIF] Skeletal mesh build failed for LOD%d."), LODIndex);
+        return false;
     }
 
     // Validate LOD
     if (NewLODModel->NumTexCoords < 1u)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[NIF] Built LOD has 0 UV channels; forcing to 1."));
+        UE_LOG(LogTemp, Warning, TEXT("[NIF] Built LOD%d has 0 UV channels; forcing to 1."), LODIndex);
         NewLODModel->NumTexCoords = 1u;
     }
     if (NewLODModel->Sections.Num() == 0)
     {
-        UE_LOG(LogTemp, Error, TEXT("[NIF] Built LOD has no sections. Aborting."));
-        bOutOperationCanceled = true;
-        return nullptr;
+        UE_LOG(LogTemp, Error, TEXT("[NIF] Built LOD%d has no sections."), LODIndex);
+        return false;
     }
 
-    // 6.5) Provide a MeshDescription for editor tools WITHOUT committing (keeps render skinning)
-    {
-        FMeshDescription* MeshDesc = SkeletalMesh->CreateMeshDescription(0); // stored by the mesh
-        if (MeshDesc)
-        {
-            FSkeletalMeshAttributes Attrs(*MeshDesc);
-            Attrs.Register();
-
-            // Create vertices
-            TArray<FVertexID> VertIDs;
-            VertIDs.SetNum(Points.Num());
-            auto Positions = Attrs.GetVertexPositions();
-            for (int32 i = 0; i < Points.Num(); ++i)
-            {
-                const FVertexID VId = MeshDesc->CreateVertex();
-                VertIDs[i] = VId;
-                Positions[VId] = Points[i];
-            }
-
-            // UVs (at least 1 channel)
-            auto UVs = Attrs.GetVertexInstanceUVs();
-            const int32 UVChannels = FMath::Max<int32>(1, (int32)NewLODModel->NumTexCoords);
-            UVs.SetNumChannels(UVChannels);
-
-            // One polygon group
-            const FPolygonGroupID PGId = MeshDesc->CreatePolygonGroup();
-
-            // Triangles from Faces/Wedges
-            for (const SkeletalMeshImportData::FMeshFace& Face : Faces)
-            {
-                TArray<FVertexInstanceID> VInstIDs;
-                VInstIDs.Reserve(3);
-
-                for (int32 c = 0; c < 3; ++c)
-                {
-                    const uint32 WedgeIdx = Face.iWedge[c];
-                    const auto& W = Wedges[WedgeIdx];
-
-                    const FVertexID VId = VertIDs[(int32)W.iVertex];
-                    const FVertexInstanceID VI = MeshDesc->CreateVertexInstance(VId);
-
-                    // Channel 0 UV from wedge
-                    UVs.Set(VI, 0, FVector2f(W.UVs[0].X, W.UVs[0].Y));
-                    VInstIDs.Add(VI);
-                }
-
-                MeshDesc->CreateTriangle(PGId, VInstIDs);
-            }
-
-            // Skin Weights (write to MeshDescription for editor tools)
-            {
-                const int32 MaxInf = 8;
-                TArray<TArray<TPair<int32, float>>> PerVertex;
-                PerVertex.SetNum(Points.Num());
-
-                for (const FVertInfluence& I : Influences)
-                {
-                    if (I.Weight > 0.f && I.VertIndex >= 0 && I.VertIndex < (uint32)Points.Num())
-                    {
-                        PerVertex[I.VertIndex].Add(TPair<int32, float>((int32)I.BoneIndex, I.Weight));
-                    }
-                }
-
-                // Sort/trim/renormalize per vertex
-                for (int32 v = 0; v < PerVertex.Num(); ++v)
-                {
-                    auto& L = PerVertex[v];
-                    if (L.Num() == 0)
-                    {
-                        L.Add(TPair<int32, float>(0, 1.f));
-                    }
-
-                    L.Sort([](const TPair<int32, float>& A, const TPair<int32, float>& B) { return A.Value > B.Value; });
-                    if (L.Num() > MaxInf) L.SetNum(MaxInf);
-
-                    float Sum = 0.f; for (const auto& P : L) Sum += P.Value;
-                    if (Sum > SMALL_NUMBER) for (auto& P : L) P.Value /= Sum;
-                }
-
-                auto VertexSkinWeights = Attrs.GetVertexSkinWeights();
-                if (VertexSkinWeights.IsValid())
-                {
-                    constexpr float kScale = 65535.0f;
-
-                    for (int32 v = 0; v < VertIDs.Num(); ++v)
-                    {
-                        const FVertexID VId = VertIDs[v];
-
-                        TArray<UE::AnimationCore::FBoneWeight> Weights;
-                        Weights.Reserve(PerVertex[v].Num());
-
-                        for (const auto& P : PerVertex[v])
-                        {
-                            const int32 BoneIdx = FMath::Clamp(P.Key, 0, RefSkeleton.GetRawBoneNum() - 1);
-                            const float Wf = FMath::Clamp(P.Value, 0.f, 1.f);
-                            const uint16 W16 = (uint16)FMath::Clamp((int32)FMath::RoundToInt(Wf * kScale), 0, 65535);
-
-                            Weights.Emplace((uint16)BoneIdx, W16);
-                        }
-
-                        VertexSkinWeights.Set(VId, MakeArrayView(Weights));
-                    }
-                }
-            }
-
-            // IMPORTANT: Do NOT call CommitMeshDescription here.
-            // Keeping MeshDescription stored enables editor tools,
-            // while the render data (with correct skin weights) stays as built above.
-        }
-    }
-
-    // 7) Materials
+    // Materials slots (minimum)
     int32 MaxSectionMatIndex = -1;
     for (const FSkelMeshSection& Sec : NewLODModel->Sections)
         MaxSectionMatIndex = FMath::Max(MaxSectionMatIndex, (int32)Sec.MaterialIndex);
@@ -419,11 +247,100 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
         while (SkeletalMesh->GetMaterials().Num() <= MaxSectionMatIndex)
             SkeletalMesh->GetMaterials().Add(FSkeletalMaterial());
 
-    for (int32 SlotIdx = 0; SlotIdx < Mesh.Materials.Num(); ++SlotIdx)
-        if (SkeletalMesh->GetMaterials().IsValidIndex(SlotIdx))
-            SkeletalMesh->GetMaterials()[SlotIdx].MaterialSlotName = *Mesh.Materials[SlotIdx].Name;
-
+    // Bounds (from this LOD’s points)
     {
+        FBox BoundsBox(ForceInit);
+        for (const FVector3f& P : Points)
+            BoundsBox += (FVector)P;
+        if (BoundsBox.IsValid)
+            SkeletalMesh->SetImportedBounds(FBoxSphereBounds(BoundsBox));
+    }
+
+    return true;
+}
+
+UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
+    UClass* InClass,
+    UObject* InParent,
+    FName InName,
+    EObjectFlags Flags,
+    const FString& Filename,
+    const TCHAR* Parms,
+    FFeedbackContext* Warn,
+    bool& bOutOperationCanceled)
+{
+    UE_LOG(LogTemp, Log, TEXT("[NIF] Importing %s"), *Filename);
+
+    // First: build LOD0 (explicit LOD request = 0)
+    FNifMeshData MeshLOD0;
+    FNifAnimationData Anim0;
+    if (!FNiflibBridge::ParseNifFileWithLOD(Filename, 0, MeshLOD0, Anim0))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[NIF] Parse failed (LOD0): %s"), *Filename);
+        bOutOperationCanceled = true;
+        return nullptr;
+    }
+
+    UE_LOG(LogTemp, Log, TEXT("[NIF] Raw LOD0 counts: Bones=%d, Vertices=%d, Faces=%d, Materials=%d"),
+        MeshLOD0.Bones.Num(), MeshLOD0.Vertices.Num(), MeshLOD0.Faces.Num(), MeshLOD0.Materials.Num());
+
+    // Create packages/assets
+    const FString BasePath = InParent->GetOutermost()->GetName();
+
+    FString SkelObjName, MeshObjName;
+    UPackage* SkelPkg = MakeAssetPackage(BasePath, InName.ToString() + TEXT("_Skeleton"), SkelObjName);
+    UPackage* MeshPkg = MakeAssetPackage(BasePath, InName.ToString(), MeshObjName);
+
+    USkeleton* Skeleton = NewObject<USkeleton>(SkelPkg, *SkelObjName, RF_Public | RF_Standalone);
+    USkeletalMesh* SkeletalMesh = NewObject<USkeletalMesh>(MeshPkg, *MeshObjName, RF_Public | RF_Standalone);
+    SkeletalMesh->SetSkeleton(Skeleton);
+
+    // Reference skeleton from LOD0
+    FReferenceSkeleton RefSkeleton(true);
+    {
+        FReferenceSkeletonModifier Mod(RefSkeleton, nullptr);
+        for (int32 i = 0; i < MeshLOD0.Bones.Num(); ++i)
+        {
+            const FNifBone& B = MeshLOD0.Bones[i];
+            const int32 ParentIndex = FMath::Max(-1, B.ParentIndex);
+
+#if WITH_EDITORONLY_DATA
+            FMeshBoneInfo BoneInfo(*B.Name, B.Name, ParentIndex);
+#else
+            FMeshBoneInfo BoneInfo(*B.Name, FString(), ParentIndex);
+#endif
+            Mod.Add(BoneInfo, FTransform(B.BindPose), false);
+        }
+    }
+    SkeletalMesh->SetRefSkeleton(RefSkeleton);
+
+    // Build LOD0
+    SkeletalMesh->GetImportedModel()->LODModels.Empty();
+    SkeletalMesh->GetLODInfoArray().Empty();
+    bool bHasImportNormalsLOD = false;
+    SkeletalMesh->AddLODInfo();
+    if (!BuildOneLOD(0, MeshLOD0, SkeletalMesh, RefSkeleton, bHasImportNormalsLOD))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[NIF] Failed building LOD0."));
+        bOutOperationCanceled = true;
+        return nullptr;
+    }
+
+    // Minimal material slots from LOD0 names
+    {
+        FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
+        int32 MaxSectionMatIndex = -1;
+        for (const FSkelMeshSection& Sec : ImportedModel->LODModels[0].Sections)
+            MaxSectionMatIndex = FMath::Max(MaxSectionMatIndex, (int32)Sec.MaterialIndex);
+
+        if (MaxSectionMatIndex >= 0)
+            while (SkeletalMesh->GetMaterials().Num() <= MaxSectionMatIndex)
+                SkeletalMesh->GetMaterials().Add(FSkeletalMaterial());
+
+        for (int32 SlotIdx = 0; SlotIdx < MeshLOD0.Materials.Num(); ++SlotIdx)
+            if (SkeletalMesh->GetMaterials().IsValidIndex(SlotIdx))
+                SkeletalMesh->GetMaterials()[SlotIdx].MaterialSlotName = *MeshLOD0.Materials[SlotIdx].Name;
+
         UMaterialInterface* DefaultMat = UMaterial::GetDefaultMaterial(MD_Surface);
         for (int32 SlotIdx = 0; SlotIdx < SkeletalMesh->GetMaterials().Num(); ++SlotIdx)
         {
@@ -433,31 +350,52 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
         }
     }
 
-    // Bounds
+    // Try to add successive LODs: LOD1, LOD2, ... until parse returns no faces
+    const int32 kMaxTryLODs = 8; // safety cap
+    for (int32 LodIdx = 1; LodIdx < kMaxTryLODs; ++LodIdx)
     {
-        FBox BoundsBox(ForceInit);
-        for (const FVector3f& P : Points)
-            BoundsBox += (FVector)P;
-        if (BoundsBox.IsValid)
-            SkeletalMesh->SetImportedBounds(FBoxSphereBounds(BoundsBox));
+        FNifMeshData MeshLodN;
+        FNifAnimationData AnimN;
+        if (!FNiflibBridge::ParseNifFileWithLOD(Filename, LodIdx, MeshLodN, AnimN))
+        {
+            UE_LOG(LogTemp, Log, TEXT("[NIF] LOD%d parse returned no geometry; stopping."), LodIdx);
+            break;
+        }
+
+        if (MeshLodN.Faces.Num() == 0 || MeshLodN.Vertices.Num() == 0)
+        {
+            UE_LOG(LogTemp, Log, TEXT("[NIF] LOD%d empty; stopping."), LodIdx);
+            break;
+        }
+
+        UE_LOG(LogTemp, Log, TEXT("[NIF] Raw LOD%d counts: Bones=%d, Vertices=%d, Faces=%d, Materials=%d"),
+            LodIdx, MeshLodN.Bones.Num(), MeshLodN.Vertices.Num(), MeshLodN.Faces.Num(), MeshLodN.Materials.Num());
+
+        bool bHasImportNormalsThisLOD = false;
+        SkeletalMesh->AddLODInfo();
+        if (!BuildOneLOD(LodIdx, MeshLodN, SkeletalMesh, RefSkeleton, bHasImportNormalsThisLOD))
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[NIF] Failed building LOD%d; stopping further LODs."), LodIdx);
+            break;
+        }
     }
 
     SkeletalMesh->InvalidateDeriveDataCacheGUID();
 
-    // 8) Finalize
+    // Finalize
     Skeleton->MergeAllBonesToBoneTree(SkeletalMesh);
     SkeletalMesh->CalculateInvRefMatrices();
     SkeletalMesh->PostEditChange();
     Skeleton->PostEditChange();
 
-    // 9) Register
+    // Register
     FAssetRegistryModule::AssetCreated(Skeleton);
     FAssetRegistryModule::AssetCreated(SkeletalMesh);
     SkelPkg->MarkPackageDirty();
     MeshPkg->MarkPackageDirty();
 
-    UE_LOG(LogTemp, Log, TEXT("[NIF] Imported SkeletalMesh %s  (Bones: %d, Tris: %d)"),
-        *MeshObjName, Mesh.Bones.Num(), Mesh.Faces.Num());
+    UE_LOG(LogTemp, Log, TEXT("[NIF] Imported SkeletalMesh %s  (LODs: %d)"),
+        *MeshObjName, SkeletalMesh->GetImportedModel()->LODModels.Num());
 
     return SkeletalMesh;
 }
