@@ -25,7 +25,7 @@ using namespace Niflib;
 
 namespace
 {
-    // --------- toggle(s) ---------
+    // --------- toggles ---------
     static constexpr bool bCreateStubBonesForUnmappedSkinBones = true;
 
     // --------- small helpers ---------
@@ -39,7 +39,6 @@ namespace
     }
     static FORCEINLINE FVector2f ToUE_FlipV(const TexCoord& uv)
     {
-        // UE expects origin at top-left; many NIFs are bottom-left
         const float u = FMath::IsFinite((float)uv.u) ? (float)uv.u : 0.0f;
         const float v = FMath::IsFinite((float)uv.v) ? (float)uv.v : 0.0f;
         return FVector2f(u, 1.0f - v);
@@ -51,7 +50,7 @@ namespace
         const Matrix33 R = Obj->GetLocalRotation();
         const float S = Obj->GetLocalScale();
 
-        const FMatrix Rot(
+        FMatrix Rot(
             FPlane((float)R[0][0], (float)R[0][1], (float)R[0][2], 0.f),
             FPlane((float)R[1][0], (float)R[1][1], (float)R[1][2], 0.f),
             FPlane((float)R[2][0], (float)R[2][1], (float)R[2][2], 0.f),
@@ -81,20 +80,13 @@ namespace
         FNifMeshData& Mesh;
         int32 VertexBase = 0;
 
-        // Map by **pointer identity** -> UE bone index
         TMap<const void*, int32> NodeToBoneIndex;
-
-        // Secondary map by bone name
         TMap<FString, int32> NameToBoneIndex;
-
-        // Visited geometry (by underlying data)
         TSet<const void*> VisitedGeoData;
 
         bool bBonesBuilt = false;
 
-        // LOD selection: -1 = auto/highest (legacy), >=0 = specific LOD child index
         int32 RequestedLOD = -1;
-
         int32 PrimaryRootIndex = INDEX_NONE;
     };
 
@@ -307,7 +299,7 @@ namespace
                 Indices.Reserve((int32)tris.size() * 3);
                 for (const Triangle& t : tris)
                 {
-                    Indices.Add(t.v1); Indices.Add(t.v2); Indices.Add(t.v3);
+                    Indices.Add(t.v1); Indices.Add(t.v3); Indices.Add(t.v2);
                 }
             }
         }
@@ -319,7 +311,7 @@ namespace
                 Indices.Reserve((int32)tris.size() * 3);
                 for (const Triangle& t : tris)
                 {
-                    Indices.Add(t.v1); Indices.Add(t.v2); Indices.Add(t.v3);
+                    Indices.Add(t.v1); Indices.Add(t.v3); Indices.Add(t.v2);
                 }
             }
         }
@@ -330,7 +322,7 @@ namespace
         const std::vector<Vector3> Normals = GeoData->GetNormals();
         const bool bHasNormals = !Normals.empty();
 
-        // ---- UV sets: detect and log all sets, still import set 0 into Vtx.UV ----
+        // ---- UV sets (log only) ----
         const int UVSetCount = GeoData->GetUVSetCount();
         std::vector<std::vector<TexCoord>> UVSets;
         UVSets.resize(FMath::Max(0, UVSetCount));
@@ -341,7 +333,6 @@ namespace
 
         if (UVSetCount > 0)
         {
-            // Log per-set sizes and non-zero counts for quick sanity checks
             FString Sizes;
             Sizes.Reserve(64);
             for (int setIdx = 0; setIdx < UVSetCount; ++setIdx)
@@ -373,7 +364,7 @@ namespace
         {
             UE_LOG(LogTemp, Verbose, TEXT("[NIF] Geo='%s' has no UV sets."), *GeoName);
         }
-        // -------------------------------------------------------------------------
+        // ----------------------------
 
         NiSkinInstanceRef Skin = Geo->GetSkinInstance();
         NiSkinDataRef SkinData = Skin ? Skin->GetSkinData() : NiSkinDataRef();
@@ -509,7 +500,6 @@ namespace
                 Vtx.Normal = FVector3f::ZeroVector;
             }
 
-            // Use UV set 0 for now (with V-flip). We’re only *checking* for more sets above.
             if (UVSetCount > 0 && i < (int)UVSets[0].size())
             {
                 Vtx.UV = ToUE_NoFlipV(UVSets[0][i]);
@@ -609,12 +599,10 @@ namespace
             {
                 if (Ctx.RequestedLOD >= 0 && Ctx.RequestedLOD < (int32)children.size())
                 {
-                    // Build ONLY the requested LOD child
                     Traverse(children[Ctx.RequestedLOD], ParentXf, Ctx);
                 }
                 else
                 {
-                    // Legacy behavior: pick the highest-detail child
                     int32 BestIdx = -1;
                     int32 BestTris = -1;
                     for (int32 i = 0; i < (int32)children.size(); ++i)
@@ -651,7 +639,6 @@ namespace
 
 namespace FNiflibBridge
 {
-    // New: explicit LOD selector (-1 = auto/highest)
     bool ParseNifFileWithLOD(const FString& Path, int32 RequestedLOD, FNifMeshData& OutMesh, FNifAnimationData& OutAnim)
     {
         UE_LOG(LogTemp, Log, TEXT("ParseNifFile: %s (RequestedLOD=%d)"), *Path, RequestedLOD);
@@ -687,7 +674,6 @@ namespace FNiflibBridge
             Root.ParentIndex = INDEX_NONE;
             Root.BindPose = FTransform::Identity;
             OutMesh.Bones.Add(Root);
-            Ctx.PrimaryRootIndex = 0;
         }
 
         if (OutMesh.Materials.Num() == 0 && OutMesh.Faces.Num() > 0)
@@ -699,7 +685,7 @@ namespace FNiflibBridge
         OutAnim.Duration = 0.0f;
 
         UE_LOG(LogTemp, Log, TEXT("[NIF] Accumulated: Vertices=%d Faces=%d Materials=%d Bones=%d (PrimaryRoot=%d)"),
-            OutMesh.Vertices.Num(), OutMesh.Faces.Num(), OutMesh.Materials.Num(), OutMesh.Bones.Num(), Ctx.PrimaryRootIndex);
+            OutMesh.Vertices.Num(), OutMesh.Faces.Num(), OutMesh.Materials.Num(), OutMesh.Bones.Num(), 0);
 
         for (int32 i = 0; i < OutMesh.Materials.Num(); ++i)
         {
@@ -710,7 +696,6 @@ namespace FNiflibBridge
         return OutMesh.Faces.Num() > 0;
     }
 
-    // Back-compat: legacy call = “pick highest detail”
     bool ParseNifFile(const FString& Path, FNifMeshData& OutMesh, FNifAnimationData& OutAnim)
     {
         return ParseNifFileWithLOD(Path, -1, OutMesh, OutAnim);
