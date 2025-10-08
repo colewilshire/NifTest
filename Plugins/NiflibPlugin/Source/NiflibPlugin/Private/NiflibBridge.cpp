@@ -597,12 +597,18 @@ namespace
             const auto& children = LOD->GetChildren();
             if (!children.empty())
             {
-                if (Ctx.RequestedLOD >= 0 && Ctx.RequestedLOD < (int32)children.size())
+                // If a specific LOD is requested but out of range, STOP (no geometry).
+                if (Ctx.RequestedLOD >= 0)
                 {
-                    Traverse(children[Ctx.RequestedLOD], ParentXf, Ctx);
+                    if (Ctx.RequestedLOD < (int32)children.size())
+                    {
+                        Traverse(children[Ctx.RequestedLOD], ParentXf, Ctx);
+                    }
+                    // else: out-of-range -> return without traversing
                 }
                 else
                 {
+                    // No explicit LOD requested: pick the highest-triangle child (same as before).
                     int32 BestIdx = -1;
                     int32 BestTris = -1;
                     for (int32 i = 0; i < (int32)children.size(); ++i)
@@ -635,6 +641,52 @@ namespace
             }
         }
     }
+}
+
+static int32 ScanAuthoredLODCount(const std::vector<NiObjectRef>& Roots)
+{
+    int32 MaxChildren = 1; // at least LOD0
+    TArray<NiAVObjectRef> Stack;
+
+    for (const NiObjectRef& RootObj : Roots)
+    {
+        if (NiAVObjectRef RootAV = DynamicCast<NiAVObject>(RootObj))
+        {
+            Stack.Add(RootAV);
+        }
+    }
+
+    while (Stack.Num() > 0)
+    {
+        NiAVObjectRef Obj = Stack.Pop(false);
+        if (!Obj) continue;
+
+        if (NiLODNodeRef LOD = DynamicCast<NiLODNode>(Obj))
+        {
+            const auto& children = LOD->GetChildren();
+            if (!children.empty())
+            {
+                MaxChildren = FMath::Max<int32>(MaxChildren, (int32)children.size());
+                for (const NiAVObjectRef& c : children)
+                {
+                    if (c) Stack.Add(c);
+                }
+                // continue to descend; nested LODs should be respected
+                continue;
+            }
+        }
+
+        if (NiNodeRef Node = DynamicCast<NiNode>(Obj))
+        {
+            const auto& children = Node->GetChildren();
+            for (const NiAVObjectRef& c : children)
+            {
+                if (c) Stack.Add(c);
+            }
+        }
+    }
+
+    return MaxChildren;
 }
 
 namespace FNiflibBridge
@@ -699,5 +751,15 @@ namespace FNiflibBridge
     bool ParseNifFile(const FString& Path, FNifMeshData& OutMesh, FNifAnimationData& OutAnim)
     {
         return ParseNifFileWithLOD(Path, -1, OutMesh, OutAnim);
+    }
+
+    int32 GetAuthoredLODCount(const FString& Path)
+    {
+        std::string NativePath = TCHAR_TO_UTF8(*Path);
+        NifInfo info;
+        vector<NiObjectRef> Roots = ReadNifList(NativePath, &info);
+        if (Roots.empty())
+            return 1;
+        return ScanAuthoredLODCount(Roots);
     }
 }

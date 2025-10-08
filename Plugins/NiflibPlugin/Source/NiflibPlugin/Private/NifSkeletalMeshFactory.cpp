@@ -371,8 +371,12 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
     }
 
     // Try to add successive LODs: LOD1, LOD2, ... until parse returns no faces
-    const int32 kMaxTryLODs = 8; // safety cap
-    for (int32 LodIdx = 1; LodIdx < kMaxTryLODs; ++LodIdx)
+    // Cap by authored LOD count to avoid generating extra slots
+    int32 AuthoredLODCount = FNiflibBridge::GetAuthoredLODCount(Filename);
+    // We already built LOD0; start at 1 and stop before AuthoredLODCount
+    const int32 MaxRequestedLOD = FMath::Max(1, AuthoredLODCount - 1);
+
+    for (int32 LodIdx = 1; LodIdx <= MaxRequestedLOD; ++LodIdx)
     {
         FNifMeshData MeshLodN;
         FNifAnimationData AnimN;
@@ -399,6 +403,7 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
             break;
         }
     }
+
 
     SkeletalMesh->InvalidateDeriveDataCacheGUID();
 
