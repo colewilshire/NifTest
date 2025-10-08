@@ -33,9 +33,16 @@ namespace
     {
         return FVector3f((float)v.x, (float)v.y, (float)v.z);
     }
-    static FORCEINLINE FVector2f ToUE(const TexCoord& uv)
+    static FORCEINLINE FVector2f ToUE_NoFlipV(const TexCoord& uv)
     {
         return FVector2f((float)uv.u, (float)uv.v);
+    }
+    static FORCEINLINE FVector2f ToUE_FlipV(const TexCoord& uv)
+    {
+        // UE expects origin at top-left; many NIFs are bottom-left
+        const float u = FMath::IsFinite((float)uv.u) ? (float)uv.u : 0.0f;
+        const float v = FMath::IsFinite((float)uv.v) ? (float)uv.v : 0.0f;
+        return FVector2f(u, 1.0f - v);
     }
 
     static FTransform LocalToFTransform(const NiAVObjectRef& Obj)
@@ -323,12 +330,50 @@ namespace
         const std::vector<Vector3> Normals = GeoData->GetNormals();
         const bool bHasNormals = !Normals.empty();
 
+        // ---- UV sets: detect and log all sets, still import set 0 into Vtx.UV ----
         const int UVSetCount = GeoData->GetUVSetCount();
-        std::vector<TexCoord> UV0;
+        std::vector<std::vector<TexCoord>> UVSets;
+        UVSets.resize(FMath::Max(0, UVSetCount));
+        for (int setIdx = 0; setIdx < UVSetCount; ++setIdx)
+        {
+            UVSets[setIdx] = GeoData->GetUVSet(setIdx);
+        }
+
         if (UVSetCount > 0)
         {
-            UV0 = GeoData->GetUVSet(0);
+            // Log per-set sizes and non-zero counts for quick sanity checks
+            FString Sizes;
+            Sizes.Reserve(64);
+            for (int setIdx = 0; setIdx < UVSetCount; ++setIdx)
+            {
+                Sizes += (setIdx == 0 ? TEXT("") : TEXT(", "));
+                Sizes += FString::Printf(TEXT("%d:%d"), setIdx, (int32)UVSets[setIdx].size());
+            }
+            UE_LOG(LogTemp, Log, TEXT("[NIF] Geo='%s' UV sets: %d  (sizes: %s)"),
+                *GeoName, UVSetCount, *Sizes);
+
+            for (int setIdx = 0; setIdx < UVSetCount; ++setIdx)
+            {
+                int32 NonZero = 0;
+                const auto& Set = UVSets[setIdx];
+                const int32 Count = (int32)Set.size();
+                for (int32 i = 0; i < Count; ++i)
+                {
+                    const TexCoord& uv = Set[i];
+                    if ((float)uv.u != 0.0f || (float)uv.v != 0.0f)
+                    {
+                        ++NonZero;
+                    }
+                }
+                UE_LOG(LogTemp, Verbose, TEXT("[NIF] Geo='%s' UV%d non-zero verts: %d / %d"),
+                    *GeoName, setIdx, NonZero, Count);
+            }
         }
+        else
+        {
+            UE_LOG(LogTemp, Verbose, TEXT("[NIF] Geo='%s' has no UV sets."), *GeoName);
+        }
+        // -------------------------------------------------------------------------
 
         NiSkinInstanceRef Skin = Geo->GetSkinInstance();
         NiSkinDataRef SkinData = Skin ? Skin->GetSkinData() : NiSkinDataRef();
@@ -464,10 +509,15 @@ namespace
                 Vtx.Normal = FVector3f::ZeroVector;
             }
 
-            if (!UV0.empty() && i < (int)UV0.size())
-                Vtx.UV = ToUE(UV0[i]);
+            // Use UV set 0 for now (with V-flip). We’re only *checking* for more sets above.
+            if (UVSetCount > 0 && i < (int)UVSets[0].size())
+            {
+                Vtx.UV = ToUE_NoFlipV(UVSets[0][i]);
+            }
             else
+            {
                 Vtx.UV = FVector2f(0, 0);
+            }
 
             if (PerVertInfl.Num() > 0 && i < PerVertInfl.Num() && PerVertInfl[i].Num() > 0)
             {

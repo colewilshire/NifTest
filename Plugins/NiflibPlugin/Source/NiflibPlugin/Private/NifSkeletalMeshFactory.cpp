@@ -15,7 +15,7 @@
 #include "ImportUtils/SkeletalMeshImportUtils.h"
 #include "MeshDescription.h"
 #include "SkeletalMeshAttributes.h"
-#include "BoneWeights.h" // UE::AnimationCore::FBoneWeight / FBoneWeights
+#include "BoneWeights.h"
 
 UNifSkeletalMeshFactory::UNifSkeletalMeshFactory()
 {
@@ -218,7 +218,9 @@ static bool BuildOneLOD(
     );
 
     for (const FText& W : WarningMsgs)
+    {
         UE_LOG(LogTemp, Warning, TEXT("[NIF] LOD%d %s"), LODIndex, *W.ToString());
+    }
 
     if (!bBuilt)
     {
@@ -226,12 +228,30 @@ static bool BuildOneLOD(
         return false;
     }
 
-    // Validate LOD
-    if (NewLODModel->NumTexCoords < 1u)
+    // Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)
+    NewLODModel->NumTexCoords = FMath::Max<uint32>(NewLODModel->NumTexCoords, 1u);
+
+    // Sanity: count non-zero UV0s across sections after build (verifies they made it through)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[NIF] Built LOD%d has 0 UV channels; forcing to 1."), LODIndex);
-        NewLODModel->NumTexCoords = 1u;
+        int32 NonZeroSectionUV0 = 0;
+        int32 TotalSectionVerts = 0;
+        for (const FSkelMeshSection& Sec : NewLODModel->Sections)
+        {
+            TotalSectionVerts += Sec.NumVertices;
+            for (int32 vi = 0; vi < Sec.SoftVertices.Num(); ++vi)
+            {
+                const FVector2f& uv0 = Sec.SoftVertices[vi].UVs[0];
+                if (!uv0.IsNearlyZero(1e-6f))
+                {
+                    ++NonZeroSectionUV0;
+                }
+            }
+        }
+        UE_LOG(LogTemp, Log, TEXT("[NIF] LOD%d UV0 non-zero verts: %d / %d"),
+            LODIndex, NonZeroSectionUV0, TotalSectionVerts);
     }
+
+    // Validate LOD
     if (NewLODModel->Sections.Num() == 0)
     {
         UE_LOG(LogTemp, Error, TEXT("[NIF] Built LOD%d has no sections."), LODIndex);
