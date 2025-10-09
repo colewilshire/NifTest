@@ -251,9 +251,94 @@ namespace
         return 0;
     }
 
-    static void AppendGeometry(const NiAVObjectRef& Obj, const FTransform& WorldXf, FTraversalCtx& Ctx)
+    // ---------- variant selection helpers ----------
+    struct FGeoCand
     {
-        NiGeometryRef Geo = DynamicCast<NiGeometry>(Obj);
+        NiGeometryRef Geo;
+        FTransform    WorldXf;
+        FString       Name;
+        FString       BaseKey;
+        int32         Tris = 0;
+        int32         LodTag = -1; // parsed "lodN" or trailing number, if any
+    };
+
+    static int32 ExtractLODTag(const FString& NameLower)
+    {
+        // Prefer "lod<N>" pattern
+        int32 LodPos = NameLower.Find(TEXT("lod"), ESearchCase::IgnoreCase);
+        if (LodPos != INDEX_NONE)
+        {
+            int32 i = LodPos + 3;
+            int32 Val = 0;
+            bool bAny = false;
+            while (i < NameLower.Len() && FChar::IsDigit(NameLower[i]))
+            {
+                bAny = true;
+                Val = Val * 10 + (NameLower[i] - TCHAR('0'));
+                ++i;
+            }
+            if (bAny) return Val;
+        }
+
+        // Fallback: trailing digits
+        int32 i = NameLower.Len() - 1;
+        int32 mul = 1;
+        int32 val = 0;
+        bool bAny = false;
+        while (i >= 0 && FChar::IsDigit(NameLower[i]))
+        {
+            bAny = true;
+            val += (NameLower[i] - TCHAR('0')) * mul;
+            mul *= 10;
+            --i;
+        }
+        return bAny ? val : -1;
+    }
+
+    static FString BaseKeyFromName(FString InName)
+    {
+        FString L = InName.ToLower();
+
+        // drop suffix "shape"
+        if (L.EndsWith(TEXT("shape")))
+        {
+            L.LeftChopInline(5, false);
+        }
+
+        // strip proxy hints entirely to group with the base
+        int32 ShadowPos = L.Find(TEXT("shadow"));
+        if (ShadowPos != INDEX_NONE)
+        {
+            L = L.Left(ShadowPos);
+        }
+
+        // strip "_lodN..." or "lodN..." suffixes
+        int32 LodPos = L.Find(TEXT("lod"));
+        if (LodPos != INDEX_NONE)
+        {
+            L = L.Left(LodPos);
+        }
+
+        // strip trailing digits
+        int32 End = L.Len();
+        while (End > 0 && FChar::IsDigit(L[End - 1]))
+        {
+            --End;
+        }
+        L.LeftInline(End, false);
+
+        // trim trailing underscores/spaces
+        while (L.Len() > 0 && (L[L.Len() - 1] == TCHAR('_') || L[L.Len() - 1] == TCHAR(' ')))
+        {
+            L.LeftChopInline(1, false);
+        }
+
+        return L;
+    }
+
+    // Append *selected* geometry (NiGeometryRef directly)
+    static void AppendGeometryFromGeo(const NiGeometryRef& Geo, const FTransform& WorldXf, FTraversalCtx& Ctx)
+    {
         if (!Geo) return;
 
         if (NiGeometryDataRef GeoData = Geo->GetData())
@@ -262,7 +347,7 @@ namespace
             if (Ctx.VisitedGeoData.Contains(DataKey))
             {
                 UE_LOG(LogTemp, Verbose, TEXT("[NIF] Skipping duplicate geometry data: %s"),
-                    *FString(UTF8_TO_TCHAR(Obj->GetName().c_str())));
+                    *FString(UTF8_TO_TCHAR(Geo->GetName().c_str())));
                 return;
             }
             Ctx.VisitedGeoData.Add(DataKey);
@@ -272,17 +357,7 @@ namespace
             return;
         }
 
-        const FString GeoName = UTF8_TO_TCHAR(Obj->GetName().c_str());
-        const FString NameLower = GeoName.ToLower();
-        const bool bLooksProxy =
-            NameLower.Contains(TEXT("shadow")) ||
-            NameLower.Contains(TEXT("lod")) ||
-            NameLower.Contains(TEXT("low"));
-        if (bLooksProxy)
-        {
-            UE_LOG(LogTemp, Verbose, TEXT("[NIF] Skipping proxy mesh: %s"), *GeoName);
-            return;
-        }
+        const FString GeoName = UTF8_TO_TCHAR(Geo->GetName().c_str());
 
         NiGeometryDataRef GeoData = Geo->GetData();
         if (!GeoData) return;
@@ -290,8 +365,9 @@ namespace
         const int NumVerts = GeoData->GetVertexCount();
         if (NumVerts <= 0) return;
 
+        // Build triangle index list
         TArray<uint32> Indices;
-        if (NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Obj))
+        if (NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Geo))
         {
             if (NiTriShapeDataRef TriData = DynamicCast<NiTriShapeData>(GeoData))
             {
@@ -303,7 +379,7 @@ namespace
                 }
             }
         }
-        else if (NiTriStripsRef Strips = DynamicCast<NiTriStrips>(Obj))
+        else if (NiTriStripsRef Strips = DynamicCast<NiTriStrips>(Geo))
         {
             if (NiTriStripsDataRef StripsData = DynamicCast<NiTriStripsData>(GeoData))
             {
@@ -318,11 +394,10 @@ namespace
 
         if (Indices.Num() == 0) return;
 
+        // Fetch geometry streams once (avoid redefinitions)
         const std::vector<Vector3> Verts = GeoData->GetVertices();
         const std::vector<Vector3> Normals = GeoData->GetNormals();
         const bool bHasNormals = !Normals.empty();
-
-        // ---- UV sets (log only) ----
         const int UVSetCount = GeoData->GetUVSetCount();
         std::vector<std::vector<TexCoord>> UVSets;
         UVSets.resize(FMath::Max(0, UVSetCount));
@@ -331,6 +406,7 @@ namespace
             UVSets[setIdx] = GeoData->GetUVSet(setIdx);
         }
 
+        // ---- UV sets (log only) ----
         if (UVSetCount > 0)
         {
             FString Sizes;
@@ -366,6 +442,7 @@ namespace
         }
         // ----------------------------
 
+        // Skin
         NiSkinInstanceRef Skin = Geo->GetSkinInstance();
         NiSkinDataRef SkinData = Skin ? Skin->GetSkinData() : NiSkinDataRef();
 
@@ -479,6 +556,7 @@ namespace
         }
 
         const int32 Base = Ctx.VertexBase;
+
         for (int i = 0; i < NumVerts; ++i)
         {
             FNifVertex Vtx;
@@ -587,8 +665,8 @@ namespace
         Ctx.VertexBase += NumVerts;
     }
 
-    // Depth-first traversal with LOD selection
-    static void Traverse(const NiAVObjectRef& Obj, const FTransform& ParentXf, FTraversalCtx& Ctx)
+    // ------------- collection traversal (no appending here) -------------
+    static void TraverseCollect(const NiAVObjectRef& Obj, const FTransform& ParentXf, FTraversalCtx& Ctx, TArray<FGeoCand>& OutCands)
     {
         if (!Obj) return;
 
@@ -597,18 +675,15 @@ namespace
             const auto& children = LOD->GetChildren();
             if (!children.empty())
             {
-                // If a specific LOD is requested but out of range, STOP (no geometry).
                 if (Ctx.RequestedLOD >= 0)
                 {
                     if (Ctx.RequestedLOD < (int32)children.size())
                     {
-                        Traverse(children[Ctx.RequestedLOD], ParentXf, Ctx);
+                        TraverseCollect(children[Ctx.RequestedLOD], ParentXf, Ctx, OutCands);
                     }
-                    // else: out-of-range -> return without traversing
                 }
                 else
                 {
-                    // No explicit LOD requested: pick the highest-triangle child (same as before).
                     int32 BestIdx = -1;
                     int32 BestTris = -1;
                     for (int32 i = 0; i < (int32)children.size(); ++i)
@@ -621,7 +696,7 @@ namespace
                         }
                     }
                     if (BestIdx < 0) BestIdx = 0;
-                    Traverse(children[BestIdx], ParentXf, Ctx);
+                    TraverseCollect(children[BestIdx], ParentXf, Ctx, OutCands);
                 }
             }
             return;
@@ -630,18 +705,65 @@ namespace
         FTransform LocalXf = LocalToFTransform(Obj);
         FTransform WorldXf = LocalXf * ParentXf;
 
-        AppendGeometry(Obj, WorldXf, Ctx);
+        if (NiGeometryRef Geo = DynamicCast<NiGeometry>(Obj))
+        {
+            const FString GeoName = UTF8_TO_TCHAR(Geo->GetName().c_str());
+            const FString NameLower = GeoName.ToLower();
+
+            // Skip proxy-like names at collection time
+            const bool bLooksProxy =
+                NameLower.Contains(TEXT("shadow")) ||
+                NameLower.Contains(TEXT("lod")) ||
+                NameLower.Contains(TEXT("low"));
+            if (bLooksProxy)
+            {
+                UE_LOG(LogTemp, Verbose, TEXT("[NIF] Collect: skipping proxy '%s'"), *GeoName);
+            }
+            else
+            {
+                FGeoCand C;
+                C.Geo = Geo;
+                C.WorldXf = WorldXf;
+                C.Name = GeoName;
+                C.BaseKey = BaseKeyFromName(GeoName);
+                C.Tris = GetTriangleCount(Obj);
+                C.LodTag = ExtractLODTag(NameLower);
+                OutCands.Add(C);
+            }
+        }
 
         if (NiNodeRef Node = DynamicCast<NiNode>(Obj))
         {
             const auto& children = Node->GetChildren();
             for (const NiAVObjectRef& c : children)
             {
-                if (c) Traverse(c, WorldXf, Ctx);
+                if (c) TraverseCollect(c, WorldXf, Ctx, OutCands);
             }
         }
     }
-}
+
+    static int32 GetTriangleCountGeo(const NiGeometryRef& Geo)
+    {
+        if (!Geo) return 0;
+        NiGeometryDataRef GeoData = Geo->GetData();
+        if (!GeoData) return 0;
+        if (NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Geo))
+        {
+            if (NiTriShapeDataRef TriData = DynamicCast<NiTriShapeData>(GeoData))
+            {
+                return (int32)TriData->GetTriangles().size();
+            }
+        }
+        else if (NiTriStripsRef Strips = DynamicCast<NiTriStrips>(Geo))
+        {
+            if (NiTriStripsDataRef StripsData = DynamicCast<NiTriStripsData>(GeoData))
+            {
+                return (int32)StripsData->GetTriangles().size();
+            }
+        }
+        return 0;
+    }
+} // anonymous namespace
 
 static int32 ScanAuthoredLODCount(const std::vector<NiObjectRef>& Roots)
 {
@@ -671,7 +793,6 @@ static int32 ScanAuthoredLODCount(const std::vector<NiObjectRef>& Roots)
                 {
                     if (c) Stack.Add(c);
                 }
-                // continue to descend; nested LODs should be respected
                 continue;
             }
         }
@@ -711,12 +832,63 @@ namespace FNiflibBridge
         FTraversalCtx Ctx{ OutMesh };
         Ctx.RequestedLOD = RequestedLOD;
 
+        // Phase 1: collect all candidate geos
+        TArray<FGeoCand> Cands;
         for (const NiObjectRef& RootObj : Roots)
         {
             if (NiAVObjectRef RootAV = DynamicCast<NiAVObject>(RootObj))
             {
-                Traverse(RootAV, FTransform::Identity, Ctx);
+                TraverseCollect(RootAV, FTransform::Identity, Ctx, Cands);
             }
+        }
+
+        // Phase 2: choose ONE per base key
+        TMap<FString, int32> BestByKey; // key -> index into Cands
+        for (int32 i = 0; i < Cands.Num(); ++i)
+        {
+            const FGeoCand& C = Cands[i];
+
+            int32* Found = BestByKey.Find(C.BaseKey);
+            if (!Found)
+            {
+                BestByKey.Add(C.BaseKey, i);
+                continue;
+            }
+
+            const FGeoCand& Cur = Cands[*Found];
+
+            // If a LOD was explicitly requested, prefer an exact LOD tag match
+            if (Ctx.RequestedLOD >= 0)
+            {
+                const bool NewMatch = (C.LodTag == Ctx.RequestedLOD);
+                const bool CurMatch = (Cur.LodTag == Ctx.RequestedLOD);
+
+                if (NewMatch && !CurMatch)
+                {
+                    *Found = i;
+                    continue;
+                }
+                if (CurMatch && !NewMatch)
+                {
+                    continue;
+                }
+                // else tie-break: fall through to triangle count
+            }
+
+            // Otherwise or on tie: prefer higher triangle count
+            const int32 CurTris = Cur.Tris;
+            const int32 NewTris = (C.Tris > 0) ? C.Tris : GetTriangleCountGeo(C.Geo);
+            if (NewTris > CurTris)
+            {
+                *Found = i;
+            }
+        }
+
+        // Phase 3: append only the selected geometries
+        for (const TPair<FString, int32>& Pair : BestByKey)
+        {
+            const FGeoCand& C = Cands[Pair.Value];
+            AppendGeometryFromGeo(C.Geo, C.WorldXf, Ctx);
         }
 
         if (OutMesh.Bones.Num() == 0)
