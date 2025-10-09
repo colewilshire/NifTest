@@ -16,6 +16,7 @@
 #include <obj/NiMaterialProperty.h>
 #include <obj/NiTexturingProperty.h>
 #include <obj/NiSourceTexture.h>
+#include <obj/NiStencilProperty.h>
 #include <gen/enums.h>
 #include <obj/NiSkinInstance.h>
 #include <obj/NiSkinData.h>
@@ -225,6 +226,20 @@ namespace
         return FString();
     }
 
+    static bool HasStencilProperty(const NiGeometryRef& Geo)
+    {
+        if (!Geo) return false;
+        const std::vector<NiPropertyRef> props = Geo->GetProperties();
+        for (const NiPropertyRef& p : props)
+        {
+            if (DynamicCast<NiStencilProperty>(p))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     static int32 GetTriangleCount(const NiAVObjectRef& Obj)
     {
         if (!Obj) return 0;
@@ -341,6 +356,7 @@ namespace
     {
         if (!Geo) return;
 
+        // Quick duplicate-data guard
         if (NiGeometryDataRef GeoData = Geo->GetData())
         {
             const void* DataKey = GeoData.operator->();
@@ -358,12 +374,54 @@ namespace
         }
 
         const FString GeoName = UTF8_TO_TCHAR(Geo->GetName().c_str());
-
         NiGeometryDataRef GeoData = Geo->GetData();
         if (!GeoData) return;
 
         const int NumVerts = GeoData->GetVertexCount();
         if (NumVerts <= 0) return;
+
+        // Streams we need to compute the proxy/shadow heuristic
+        const int UVSetCount = GeoData->GetUVSetCount();
+        std::vector<std::vector<TexCoord>> UVSets;
+        UVSets.resize(FMath::Max(0, UVSetCount));
+        for (int setIdx = 0; setIdx < UVSetCount; ++setIdx)
+        {
+            UVSets[setIdx] = GeoData->GetUVSet(setIdx);
+        }
+
+        // Compute UV0 non-zero coverage
+        int32 UV0Count = 0, UV0NonZero = 0;
+        if (UVSetCount > 0)
+        {
+            const auto& Set0 = UVSets[0];
+            UV0Count = (int32)Set0.size();
+            for (int32 i = 0; i < UV0Count; ++i)
+            {
+                const TexCoord& uv = Set0[i];
+                if ((float)uv.u != 0.0f || (float)uv.v != 0.0f)
+                {
+                    ++UV0NonZero;
+                }
+            }
+        }
+        const float UV0Coverage = (UV0Count > 0) ? (float)UV0NonZero / (float)UV0Count : 0.0f;
+
+        // Diffuse / stencil signals
+        const FString DiffusePath = GetDiffuseTexturePath(Geo);
+        const bool bStencil = HasStencilProperty(Geo);
+        const bool bLooksProxyByUV = (UV0Count == 0) || (UV0Coverage < 0.20f);
+        const bool bLooksProxy = ((DiffusePath.IsEmpty() && bLooksProxyByUV) || bStencil);
+
+        if (bLooksProxy)
+        {
+            UE_LOG(LogTemp, Log,
+                TEXT("[NIF] Skipping proxy/shadow geo '%s'  UV0=%d/%d (%.1f%%)  Diffuse='%s'  Stencil=%s"),
+                *GeoName,
+                UV0NonZero, UV0Count, UV0Coverage * 100.f,
+                *DiffusePath,
+                bStencil ? TEXT("true") : TEXT("false"));
+            return;
+        }
 
         // Build triangle index list
         TArray<uint32> Indices;
@@ -391,26 +449,17 @@ namespace
                 }
             }
         }
-
         if (Indices.Num() == 0) return;
 
-        // Fetch geometry streams once (avoid redefinitions)
+        // Fetch remaining streams for building vertices
         const std::vector<Vector3> Verts = GeoData->GetVertices();
         const std::vector<Vector3> Normals = GeoData->GetNormals();
         const bool bHasNormals = !Normals.empty();
-        const int UVSetCount = GeoData->GetUVSetCount();
-        std::vector<std::vector<TexCoord>> UVSets;
-        UVSets.resize(FMath::Max(0, UVSetCount));
-        for (int setIdx = 0; setIdx < UVSetCount; ++setIdx)
-        {
-            UVSets[setIdx] = GeoData->GetUVSet(setIdx);
-        }
 
         // ---- UV sets (log only) ----
         if (UVSetCount > 0)
         {
-            FString Sizes;
-            Sizes.Reserve(64);
+            FString Sizes; Sizes.Reserve(64);
             for (int setIdx = 0; setIdx < UVSetCount; ++setIdx)
             {
                 Sizes += (setIdx == 0 ? TEXT("") : TEXT(", "));
@@ -561,14 +610,14 @@ namespace
         {
             FNifVertex Vtx;
 
-            FVector3f p = ToUE(Verts[i]);
+            FVector3f p = ToUE(GeoData->GetVertices()[i]);
             FVector P3 = FVector(p);
             P3 = WorldXf.TransformPosition(P3);
             Vtx.Position = (FVector3f)P3;
 
-            if (bHasNormals && i < (int)Normals.size())
+            if (!GeoData->GetNormals().empty() && i < (int)GeoData->GetNormals().size())
             {
-                FVector3f n = ToUE(Normals[i]);
+                FVector3f n = ToUE(GeoData->GetNormals()[i]);
                 FVector N3 = FVector(n);
                 N3 = WorldXf.TransformVectorNoScale(N3);
                 Vtx.Normal = (FVector3f)N3.GetSafeNormal();
@@ -617,7 +666,7 @@ namespace
                 }
             }
 
-            const FString DiffusePath = GetDiffuseTexturePath(Geo);
+            const FString DiffusePathForMat = GetDiffuseTexturePath(Geo);
 
             int32 Found = INDEX_NONE;
             for (int32 i = 0; i < Ctx.Mesh.Materials.Num(); ++i)
@@ -629,7 +678,7 @@ namespace
             {
                 FNifMaterial NewMat;
                 NewMat.Name = MatName;
-                NewMat.DiffuseTexturePath = DiffusePath;
+                NewMat.DiffuseTexturePath = DiffusePathForMat;
                 Ctx.Mesh.Materials.Add(NewMat);
                 MatIndex = Ctx.Mesh.Materials.Num() - 1;
             }
@@ -637,16 +686,16 @@ namespace
             {
                 MatIndex = Found;
                 FNifMaterial& Existing = Ctx.Mesh.Materials[Found];
-                if (Existing.DiffuseTexturePath.IsEmpty() && !DiffusePath.IsEmpty())
+                if (Existing.DiffuseTexturePath.IsEmpty() && !DiffusePathForMat.IsEmpty())
                 {
-                    Existing.DiffuseTexturePath = DiffusePath;
+                    Existing.DiffuseTexturePath = DiffusePathForMat;
                 }
-                else if (!DiffusePath.IsEmpty() && !Existing.DiffuseTexturePath.IsEmpty() &&
-                    !Existing.DiffuseTexturePath.Equals(DiffusePath, ESearchCase::IgnoreCase))
+                else if (!DiffusePathForMat.IsEmpty() && !Existing.DiffuseTexturePath.IsEmpty() &&
+                    !Existing.DiffuseTexturePath.Equals(DiffusePathForMat, ESearchCase::IgnoreCase))
                 {
                     UE_LOG(LogTemp, Warning,
                         TEXT("[NIF] Material '%s' appears with different diffuse textures: '%s' vs '%s'"),
-                        *MatName, *Existing.DiffuseTexturePath, *DiffusePath);
+                        *MatName, *Existing.DiffuseTexturePath, *DiffusePathForMat);
                 }
             }
         }
@@ -710,26 +759,14 @@ namespace
             const FString GeoName = UTF8_TO_TCHAR(Geo->GetName().c_str());
             const FString NameLower = GeoName.ToLower();
 
-            // Skip proxy-like names at collection time
-            const bool bLooksProxy =
-                NameLower.Contains(TEXT("shadow")) ||
-                NameLower.Contains(TEXT("lod")) ||
-                NameLower.Contains(TEXT("low"));
-            if (bLooksProxy)
-            {
-                UE_LOG(LogTemp, Verbose, TEXT("[NIF] Collect: skipping proxy '%s'"), *GeoName);
-            }
-            else
-            {
-                FGeoCand C;
-                C.Geo = Geo;
-                C.WorldXf = WorldXf;
-                C.Name = GeoName;
-                C.BaseKey = BaseKeyFromName(GeoName);
-                C.Tris = GetTriangleCount(Obj);
-                C.LodTag = ExtractLODTag(NameLower);
-                OutCands.Add(C);
-            }
+            FGeoCand C;
+            C.Geo = Geo;
+            C.WorldXf = WorldXf;
+            C.Name = GeoName;
+            C.BaseKey = BaseKeyFromName(GeoName);
+            C.Tris = GetTriangleCount(Obj);
+            C.LodTag = ExtractLODTag(NameLower);
+            OutCands.Add(C);
         }
 
         if (NiNodeRef Node = DynamicCast<NiNode>(Obj))
