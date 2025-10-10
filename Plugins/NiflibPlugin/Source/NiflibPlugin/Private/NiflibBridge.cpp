@@ -65,6 +65,26 @@ namespace
         return Xf;
     }
 
+    static FTransform ComputeWorldTransform(const NiAVObjectRef& Obj)
+    {
+        if (!Obj) return FTransform::Identity;
+
+        FTransform World = LocalToFTransform(Obj);
+
+        NiNodeRef Parent = Obj->GetParent();
+        while (Parent)
+        {
+            NiAVObjectRef PAsAV = DynamicCast<NiAVObject>(Parent);
+            if (!PAsAV) break;
+
+            const FTransform ParentLocal = LocalToFTransform(PAsAV);
+            World = ParentLocal * World;
+
+            Parent = Parent->GetParent();
+        }
+        return World;
+    }
+
     static FString CanonName(const FString& In)
     {
         FString S = In;
@@ -240,64 +260,28 @@ namespace
         return false;
     }
 
-    // --- targeted shadow predicate (technical & minimal) ---
-    static bool IsShadowLike(const NiGeometryRef& Geo)
+    // Shadow-like geometry rule: by name or stencil property
+    static bool IsShadowLike(const NiAVObjectRef& Obj)
     {
-        if (!Geo) return false;
+        if (!Obj) return false;
 
-        // Name-based fast path
-        const FString NameLower = FString(UTF8_TO_TCHAR(Geo->GetName().c_str())).ToLower();
-        if (NameLower.Contains(TEXT("shadow")))
+        std::string nm = Obj->GetName();
+        FString L = UTF8_TO_TCHAR(nm.c_str());
+        L = L.ToLower();
+
+        if (L.Contains(TEXT("shadow")))
         {
             return true;
         }
 
-        // Stencil property is a strong indicator of shadow caster/volume
-        if (HasStencilProperty(Geo))
+        if (NiGeometryRef Geo = DynamicCast<NiGeometry>(Obj))
         {
-            return true;
+            if (HasStencilProperty(Geo))
+            {
+                return true;
+            }
         }
-
         return false;
-    }
-
-    // Find the first descendant NiTriShape of Start (or Start itself if it is one),
-    // skipping any "shadow-like" geometries. Returns nullptr if none found.
-    static NiTriShapeRef FindFirstTriShapeDesc(const NiAVObjectRef& Start, const FTransform& ParentWorld, FTransform& OutTriWorld)
-    {
-        if (!Start) return NiTriShapeRef();
-
-        FTransform Local = LocalToFTransform(Start);
-        FTransform ThisWorld = Local * ParentWorld;
-
-        if (NiTriShapeRef Tri = DynamicCast<NiTriShape>(Start))
-        {
-            NiGeometryRef AsGeo = DynamicCast<NiGeometry>(Tri);
-            if (AsGeo && IsShadowLike(AsGeo))
-            {
-                // Skip shadow-like TriShapes; fall through to check children
-            }
-            else
-            {
-                OutTriWorld = ThisWorld;
-                return Tri;
-            }
-        }
-
-        if (NiNodeRef Node = DynamicCast<NiNode>(Start))
-        {
-            const auto& children = Node->GetChildren();
-            for (const NiAVObjectRef& c : children)
-            {
-                if (!c) continue;
-                if (NiTriShapeRef Found = FindFirstTriShapeDesc(c, ThisWorld, OutTriWorld))
-                {
-                    return Found;
-                }
-            }
-        }
-
-        return NiTriShapeRef();
     }
 
     static int32 GetTriangleCount(const NiAVObjectRef& Obj)
@@ -332,21 +316,12 @@ namespace
         NiGeometryRef Geo;
         FTransform    WorldXf;
         FString       Name;
-        int32         Tris = 0;
     };
 
-    // Append a geometry (TriShape or TriStrips) into the mesh
+    // Append *selected* geometry (NiGeometryRef directly)
     static void AppendGeometryFromGeo(const NiGeometryRef& Geo, const FTransform& WorldXf, FTraversalCtx& Ctx)
     {
         if (!Geo) return;
-
-        // Targeted filter: shadow-like geometry does not get imported
-        if (IsShadowLike(Geo))
-        {
-            UE_LOG(LogTemp, Log, TEXT("[NIF][LOD] Skipping shadow geometry '%s'"),
-                *FString(UTF8_TO_TCHAR(Geo->GetName().c_str())));
-            return;
-        }
 
         // Quick duplicate-data guard
         if (NiGeometryDataRef GeoData = Geo->GetData())
@@ -362,8 +337,6 @@ namespace
         }
         else
         {
-            UE_LOG(LogTemp, Warning, TEXT("[NIF] Geometry '%s' has no data; skipping."),
-                *FString(UTF8_TO_TCHAR(Geo->GetName().c_str())));
             return;
         }
 
@@ -374,40 +347,7 @@ namespace
         const int NumVerts = GeoData->GetVertexCount();
         if (NumVerts <= 0) return;
 
-        // Build triangle index list
-        TArray<uint32> Indices;
-        if (NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Geo))
-        {
-            if (NiTriShapeDataRef TriData = DynamicCast<NiTriShapeData>(GeoData))
-            {
-                const std::vector<Triangle> tris = TriData->GetTriangles();
-                Indices.Reserve((int32)tris.size() * 3);
-                for (const Triangle& t : tris)
-                {
-                    Indices.Add(t.v1); Indices.Add(t.v3); Indices.Add(t.v2);
-                }
-            }
-        }
-        else if (NiTriStripsRef Strips = DynamicCast<NiTriStrips>(Geo))
-        {
-            if (NiTriStripsDataRef StripsData = DynamicCast<NiTriStripsData>(GeoData))
-            {
-                const std::vector<Triangle> tris = StripsData->GetTriangles();
-                Indices.Reserve((int32)tris.size() * 3);
-                for (const Triangle& t : tris)
-                {
-                    Indices.Add(t.v1); Indices.Add(t.v3); Indices.Add(t.v2);
-                }
-            }
-        }
-        if (Indices.Num() == 0) return;
-
-        // Fetch remaining streams for building vertices
-        const std::vector<Vector3> Verts = GeoData->GetVertices();
-        const std::vector<Vector3> Normals = GeoData->GetNormals();
-        const bool bHasNormals = !Normals.empty();
-
-        // Log UV sets (diagnostic; no filtering here)
+        // UV sets (for logging)
         const int UVSetCount = GeoData->GetUVSetCount();
         std::vector<std::vector<TexCoord>> UVSets;
         UVSets.resize(FMath::Max(0, UVSetCount));
@@ -415,6 +355,7 @@ namespace
         {
             UVSets[setIdx] = GeoData->GetUVSet(setIdx);
         }
+
         if (UVSetCount > 0)
         {
             FString Sizes; Sizes.Reserve(64);
@@ -425,23 +366,6 @@ namespace
             }
             UE_LOG(LogTemp, Log, TEXT("[NIF] Geo='%s' UV sets: %d  (sizes: %s)"),
                 *GeoName, UVSetCount, *Sizes);
-
-            for (int setIdx = 0; setIdx < UVSetCount; ++setIdx)
-            {
-                int32 NonZero = 0;
-                const auto& Set = UVSets[setIdx];
-                const int32 Count = (int32)Set.size();
-                for (int32 i = 0; i < Count; ++i)
-                {
-                    const TexCoord& uv = Set[i];
-                    if ((float)uv.u != 0.0f || (float)uv.v != 0.0f)
-                    {
-                        ++NonZero;
-                    }
-                }
-                UE_LOG(LogTemp, Verbose, TEXT("[NIF] Geo='%s' UV%d non-zero verts: %d / %d"),
-                    *GeoName, setIdx, NonZero, Count);
-            }
         }
         else
         {
@@ -561,8 +485,37 @@ namespace
             UE_LOG(LogTemp, Warning, TEXT("[NIF][Skin] Geo='%s' has NiSkinInstance but no NiSkinData."), *GeoName);
         }
 
+        // Build triangle index list
+        TArray<uint32> Indices;
+        if (NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Geo))
+        {
+            if (NiTriShapeDataRef TriData = DynamicCast<NiTriShapeData>(GeoData))
+            {
+                const std::vector<Triangle> tris = TriData->GetTriangles();
+                Indices.Reserve((int32)tris.size() * 3);
+                for (const Triangle& t : tris)
+                {
+                    Indices.Add(t.v1); Indices.Add(t.v3); Indices.Add(t.v2);
+                }
+            }
+        }
+        else if (NiTriStripsRef Strips = DynamicCast<NiTriStrips>(Geo))
+        {
+            if (NiTriStripsDataRef StripsData = DynamicCast<NiTriStripsData>(GeoData))
+            {
+                const std::vector<Triangle> tris = StripsData->GetTriangles();
+                Indices.Reserve((int32)tris.size() * 3);
+                for (const Triangle& t : tris)
+                {
+                    Indices.Add(t.v1); Indices.Add(t.v3); Indices.Add(t.v2);
+                }
+            }
+        }
+        if (Indices.Num() == 0) return;
+
         const int32 Base = Ctx.VertexBase;
 
+        // Emit vertices
         for (int i = 0; i < NumVerts; ++i)
         {
             FNifVertex Vtx;
@@ -593,7 +546,8 @@ namespace
                 Vtx.UV = FVector2f(0, 0);
             }
 
-            if (PerVertInfl.Num() > 0 && i < PerVertInfl.Num() && PerVertInfl[i].Num() > 0)
+            // influences
+            if (i < PerVertInfl.Num() && PerVertInfl[i].Num() > 0)
             {
                 Vtx.Influences = MoveTemp(PerVertInfl[i]);
             }
@@ -607,6 +561,7 @@ namespace
             Ctx.Mesh.Vertices.Add(Vtx);
         }
 
+        // Material slot
         int32 MatIndex = 0;
         {
             FString MatName = TEXT("NifMat");
@@ -671,8 +626,10 @@ namespace
         Ctx.VertexBase += NumVerts;
     }
 
-    // Convenience: get all NiLODNode objects in the tree
-    static void GatherAllLODNodes(const std::vector<NiObjectRef>& Roots, TArray<NiLODNodeRef>& Out)
+    // ---------- targeted NiLOD traversal utilities ----------
+
+    // Find the first NiLODNode anywhere in the forest
+    static NiLODNodeRef FindFirstLODNode(const std::vector<NiObjectRef>& Roots)
     {
         TArray<NiAVObjectRef> Stack;
         for (const NiObjectRef& RootObj : Roots)
@@ -690,34 +647,117 @@ namespace
 
             if (NiLODNodeRef LOD = DynamicCast<NiLODNode>(Obj))
             {
-                Out.Add(LOD);
+                return LOD;
             }
 
             if (NiNodeRef Node = DynamicCast<NiNode>(Obj))
             {
                 const auto& children = Node->GetChildren();
                 for (const NiAVObjectRef& c : children)
-                {
                     if (c) Stack.Add(c);
-                }
             }
         }
+        return NiLODNodeRef();
     }
 
-    // Get NiNode children that represent LOD buckets for a given NiLODNode
-    static void GatherLODNiNodeChildren(const NiLODNodeRef& LOD, TArray<NiNodeRef>& OutChildren)
+    // Collect NiNode children that act as LOD buckets
+    static void GetLODChildren(const NiLODNodeRef& LOD, TArray<NiNodeRef>& OutChildren)
     {
         OutChildren.Reset();
         if (!LOD) return;
-        const auto& children = LOD->GetChildren();
-        for (const NiAVObjectRef& c : children)
+        const auto& kids = LOD->GetChildren();
+        for (const NiAVObjectRef& c : kids)
         {
             if (!c) continue;
             if (NiNodeRef asNode = DynamicCast<NiNode>(c))
-            {
                 OutChildren.Add(asNode);
+        }
+    }
+
+    // Find the first descendant NiTriShape (non-shadow) under a start object
+    static NiTriShapeRef FindFirstNonShadowTriShapeUnder(const NiAVObjectRef& Start)
+    {
+        if (!Start) return NiTriShapeRef();
+
+        // If the start itself is a TriShape and not shadow-like, take it
+        if (NiTriShapeRef AsTri = DynamicCast<NiTriShape>(Start))
+        {
+            if (!IsShadowLike(Start)) return AsTri;
+        }
+
+        // DFS
+        TArray<NiAVObjectRef> Stack;
+        if (NiNodeRef asNode = DynamicCast<NiNode>(Start))
+        {
+            const auto& kids = asNode->GetChildren();
+            for (const NiAVObjectRef& c : kids)
+                if (c) Stack.Add(c);
+        }
+
+        while (Stack.Num() > 0)
+        {
+            NiAVObjectRef Obj = Stack.Pop(false);
+            if (!Obj) continue;
+
+            if (NiTriShapeRef Tri = DynamicCast<NiTriShape>(Obj))
+            {
+                if (!IsShadowLike(Obj))
+                    return Tri;
+            }
+
+            if (NiNodeRef N = DynamicCast<NiNode>(Obj))
+            {
+                const auto& kids = N->GetChildren();
+                for (const NiAVObjectRef& c : kids)
+                    if (c) Stack.Add(c);
             }
         }
+        return NiTriShapeRef();
+    }
+
+    // Fallback: find the first non-shadow NiTriShape anywhere in the forest
+    static NiTriShapeRef FindFirstNonShadowTriShapeInForest(const std::vector<NiObjectRef>& Roots)
+    {
+        // quick pass: direct AV objects
+        for (const NiObjectRef& RootObj : Roots)
+        {
+            if (NiAVObjectRef RootAV = DynamicCast<NiAVObject>(RootObj))
+            {
+                if (NiTriShapeRef Tri = DynamicCast<NiTriShape>(RootAV))
+                {
+                    if (!IsShadowLike(RootAV))
+                        return Tri;
+                }
+            }
+        }
+
+        // DFS through the scene
+        TArray<NiAVObjectRef> Stack;
+        for (const NiObjectRef& RootObj : Roots)
+        {
+            if (NiAVObjectRef RootAV = DynamicCast<NiAVObject>(RootObj))
+                Stack.Add(RootAV);
+        }
+
+        while (Stack.Num() > 0)
+        {
+            NiAVObjectRef Obj = Stack.Pop(false);
+            if (!Obj) continue;
+
+            if (NiTriShapeRef Tri = DynamicCast<NiTriShape>(Obj))
+            {
+                if (!IsShadowLike(Obj))
+                    return Tri;
+            }
+
+            if (NiNodeRef Node = DynamicCast<NiNode>(Obj))
+            {
+                const auto& kids = Node->GetChildren();
+                for (const NiAVObjectRef& c : kids)
+                    if (c) Stack.Add(c);
+            }
+        }
+        return NiTriShapeRef();
     }
 
     static int32 GetTriangleCountGeo(const NiGeometryRef& Geo)
@@ -741,6 +781,7 @@ namespace
         }
         return 0;
     }
+
 } // anonymous namespace
 
 static int32 ScanAuthoredLODCount(const std::vector<NiObjectRef>& Roots)
@@ -772,6 +813,7 @@ static int32 ScanAuthoredLODCount(const std::vector<NiObjectRef>& Roots)
                     if (DynamicCast<NiNode>(c)) { ++ChildCount; }
                 }
                 MaxChildren = FMath::Max<int32>(MaxChildren, ChildCount);
+
                 for (const NiAVObjectRef& c : children)
                 {
                     if (c) Stack.Add(c);
@@ -815,87 +857,120 @@ namespace FNiflibBridge
         FTraversalCtx Ctx{ OutMesh };
         Ctx.RequestedLOD = RequestedLOD;
 
-        // 1) Find all NiLODNodes
-        TArray<NiLODNodeRef> LODNodes;
-        GatherAllLODNodes(Roots, LODNodes);
-        if (LODNodes.Num() == 0)
+        // ---- Primary path: Find NiLODNode and build from its LOD buckets ----
+        if (NiLODNodeRef LOD = FindFirstLODNode(Roots))
         {
-            UE_LOG(LogTemp, Error, TEXT("[NIF][LOD] No NiLODNode found; cannot extract authored LODs."));
-            return false;
-        }
+            // Collect LOD bucket children
+            TArray<NiNodeRef> Buckets;
+            GetLODChildren(LOD, Buckets);
 
-        // We'll use the first LOD node we find (common case)
-        NiLODNodeRef MainLOD = LODNodes[0];
-        const FString LODName = UTF8_TO_TCHAR(MainLOD->GetName().c_str());
+            UE_LOG(LogTemp, Log, TEXT("[NIF][LOD] NiLODNode '%s' exposes %d LOD bucket(s)"),
+                *FString(UTF8_TO_TCHAR(LOD->GetName().c_str())), Buckets.Num());
 
-        // 2) Gather LOD NiNode children (buckets)
-        TArray<NiNodeRef> LODBuckets;
-        GatherLODNiNodeChildren(MainLOD, LODBuckets);
-        if (LODBuckets.Num() == 0)
-        {
-            UE_LOG(LogTemp, Error, TEXT("[NIF][LOD] NiLODNode '%s' has no NiNode children; cannot extract LODs."), *LODName);
-            return false;
-        }
-
-        UE_LOG(LogTemp, Log, TEXT("[NIF][LOD] NiLODNode '%s' exposes %d LOD bucket(s)"), *LODName, LODBuckets.Num());
-
-        // 3) Choose which bucket to build (ParseNifFileWithLOD builds a single requested LOD)
-        int32 ChosenIdx = 0;
-        if (RequestedLOD >= 0 && RequestedLOD < LODBuckets.Num())
-        {
-            ChosenIdx = RequestedLOD;
-        }
-        else if (RequestedLOD >= 0)
-        {
-            UE_LOG(LogTemp, Error, TEXT("[NIF][LOD] RequestedLOD=%d is out of range (buckets=%d)."), RequestedLOD, LODBuckets.Num());
-            return false;
-        }
-
-        {
-            FString BucketName = UTF8_TO_TCHAR(LODBuckets[ChosenIdx]->GetName().c_str());
-            UE_LOG(LogTemp, Log, TEXT("[NIF][LOD] Selecting LOD bucket %d: '%s'"), ChosenIdx, *BucketName);
-        }
-
-        // 4) Iterate each child of the selected LOD bucket. For each child:
-        //    - If it is a NiTriShape: (and not shadow-like) append it.
-        //    - Else: find its first descendant NiTriShape (skipping shadow-like), append it.
-        NiNodeRef SelectedBucket = LODBuckets[ChosenIdx];
-        const auto& Children = SelectedBucket->GetChildren();
-
-        int32 AppendedCount = 0;
-
-        for (const NiAVObjectRef& Child : Children)
-        {
-            if (!Child) continue;
-
-            FTransform TriWorld = FTransform::Identity;
-            NiTriShapeRef Tri = FindFirstTriShapeDesc(Child, FTransform::Identity, TriWorld);
-            if (!Tri)
+            if (Buckets.Num() == 0)
             {
-                const FString CName = UTF8_TO_TCHAR(Child->GetName().c_str());
-                UE_LOG(LogTemp, Warning, TEXT("[NIF][LOD] No non-shadow TriShape found under child '%s'"), *CName);
-                continue;
+                UE_LOG(LogTemp, Error, TEXT("[NIF][LOD] LOD node has no NiNode children."));
+                return false;
             }
 
-            // Append geometry of the found TriShape (or its NiGeometry interface)
-            NiGeometryRef AsGeo = DynamicCast<NiGeometry>(Tri);
-            if (!AsGeo)
+            const int32 ClampedLOD = (RequestedLOD < 0) ? 0 : FMath::Clamp(RequestedLOD, 0, Buckets.Num() - 1);
+            if (RequestedLOD >= 0 && RequestedLOD != ClampedLOD)
             {
-                const FString TName = UTF8_TO_TCHAR(Tri->GetName().c_str());
-                UE_LOG(LogTemp, Warning, TEXT("[NIF][LOD] Found TriShape '%s' but could not treat as NiGeometry; skipping."), *TName);
-                continue;
+                UE_LOG(LogTemp, Warning, TEXT("[NIF][LOD] RequestedLOD=%d out of range; clamped to %d"),
+                    RequestedLOD, ClampedLOD);
             }
 
-            AppendGeometryFromGeo(AsGeo, TriWorld, Ctx);
-            ++AppendedCount;
-        }
+            NiNodeRef Selected = Buckets[ClampedLOD];
+            FString SelName = Selected ? UTF8_TO_TCHAR(Selected->GetName().c_str()) : TEXT("<null>");
+            UE_LOG(LogTemp, Log, TEXT("[NIF][LOD] Selecting LOD bucket %d: '%s'"), ClampedLOD, *SelName);
 
-        if (AppendedCount == 0)
+            if (!Selected)
+            {
+                UE_LOG(LogTemp, Error, TEXT("[NIF][LOD] Selected bucket AVObject was null."));
+                return false;
+            }
+
+            // Iterate children of the selected bucket
+            const auto& kids = Selected->GetChildren();
+            int32 FoundAny = 0;
+            for (const NiAVObjectRef& childAV : kids)
+            {
+                if (!childAV) continue;
+
+                // Direct TriShape child
+                if (NiTriShapeRef AsTri = DynamicCast<NiTriShape>(childAV))
+                {
+                    if (!IsShadowLike(childAV))
+                    {
+                        NiGeometryRef Geo = DynamicCast<NiGeometry>(AsTri);
+                        NiAVObjectRef AsAV = DynamicCast<NiAVObject>(AsTri);
+                        if (Geo && AsAV)
+                        {
+                            const FTransform Xf = ComputeWorldTransform(AsAV);
+                            AppendGeometryFromGeo(Geo, Xf, Ctx);
+                            ++FoundAny;
+                            continue;
+                        }
+                    }
+                }
+
+                // Descendant TriShape
+                NiTriShapeRef DescTri = FindFirstNonShadowTriShapeUnder(childAV);
+                if (DescTri)
+                {
+                    NiGeometryRef Geo = DynamicCast<NiGeometry>(DescTri);
+                    NiAVObjectRef AsAV = DynamicCast<NiAVObject>(DescTri);
+                    if (Geo && AsAV)
+                    {
+                        const FTransform TriWorld = ComputeWorldTransform(AsAV);
+                        AppendGeometryFromGeo(Geo, TriWorld, Ctx);
+                        ++FoundAny;
+                        continue;
+                    }
+                }
+
+                FString ChName = UTF8_TO_TCHAR(childAV->GetName().c_str());
+                UE_LOG(LogTemp, Warning, TEXT("[NIF][LOD] No non-shadow TriShape found under child '%s'"), *ChName);
+            }
+
+            if (FoundAny == 0)
+            {
+                UE_LOG(LogTemp, Error, TEXT("[NIF][LOD] Selected LOD bucket produced no usable TriShapes."));
+                return false;
+            }
+        }
+        else
         {
-            UE_LOG(LogTemp, Error, TEXT("[NIF][LOD] Selected LOD bucket produced no importable geometry."));
-            return false;
+            // ---- Fallback path: no NiLODNode ----
+            if (RequestedLOD > 0)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[NIF][LOD] No NiLODNode found; ignoring RequestedLOD=%d and importing a single LOD0."), RequestedLOD);
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[NIF][LOD] No NiLODNode found; falling back to first TriShape as single LOD0."));
+            }
+
+            NiTriShapeRef FirstTri = FindFirstNonShadowTriShapeInForest(Roots);
+            if (!FirstTri)
+            {
+                UE_LOG(LogTemp, Error, TEXT("[NIF][LOD] Fallback failed; no non-shadow NiTriShape found in scene."));
+                return false;
+            }
+
+            NiGeometryRef Geo = DynamicCast<NiGeometry>(FirstTri);
+            NiAVObjectRef AsAV = DynamicCast<NiAVObject>(FirstTri);
+            if (!Geo || !AsAV)
+            {
+                UE_LOG(LogTemp, Error, TEXT("[NIF][LOD] Fallback TriShape could not be cast to required base types."));
+                return false;
+            }
+
+            const FTransform TriWorld = ComputeWorldTransform(AsAV);
+            AppendGeometryFromGeo(Geo, TriWorld, Ctx);
         }
 
+        // Guarantee at least one root bone
         if (OutMesh.Bones.Num() == 0)
         {
             FNifBone Root;
@@ -905,6 +980,7 @@ namespace FNiflibBridge
             OutMesh.Bones.Add(Root);
         }
 
+        // Ensure we have a material if faces exist
         if (OutMesh.Materials.Num() == 0 && OutMesh.Faces.Num() > 0)
         {
             FNifMaterial M; M.Name = TEXT("NifMat");
