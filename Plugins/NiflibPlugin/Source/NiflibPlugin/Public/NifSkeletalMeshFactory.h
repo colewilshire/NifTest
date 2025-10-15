@@ -11,6 +11,8 @@
 // Generated
 #include "NifSkeletalMeshFactory.generated.h"
 
+using namespace Niflib;
+
 UCLASS()
 class UNifSkeletalMeshFactory : public UFactory
 {
@@ -19,9 +21,7 @@ class UNifSkeletalMeshFactory : public UFactory
 public:
 	UNifSkeletalMeshFactory();
 
-	// UFactory interface
 	virtual bool FactoryCanImport(const FString& Filename) override;
-
 	virtual UObject* FactoryCreateFile(
 		UClass* InClass,
 		UObject* InParent,
@@ -34,7 +34,17 @@ public:
 	) override;
 
 private:
-	void GetNiTriShapes(const FString& Filename);
+	struct FNifReferenceSkeleton
+	{
+		TArray<FName> BoneNames;
+		TArray<int32> ParentIndices;
+		TArray<FTransform> RefPose;
+	};
+
+	FNifReferenceSkeleton ParseNif(const FString& Filename);
+	FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& NextBone, const int32 PreviousIndex = -1, const int32 ParentIndex = -1, const UNifSkeletalMeshFactory::FNifReferenceSkeleton Skeleton = {});
+	std::map<Niflib::NiNodeRef, std::vector<Niflib::NiTriShapeRef>> GetNiTriShapes(const FString& Filename);
 	Niflib::NiNodeRef FindFirstAncestorThatIsALod(const Niflib::NiNodeRef& niNodeRef);
-	void GetNifSkeleton(const Niflib::NiTriShapeRef& niTriShapeRef);
+	FNifReferenceSkeleton GetNifSkeleton(const Niflib::NiTriShapeRef& niTriShapeRef);
+	FReferenceSkeleton BuildReferenceSkeleton(const TArray<FName>& BoneNames, const TArray<int32>& ParentIndices, const TArray<FTransform>& RefPose);
 };

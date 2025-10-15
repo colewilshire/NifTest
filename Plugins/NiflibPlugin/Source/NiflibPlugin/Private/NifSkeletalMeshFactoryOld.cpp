@@ -21,12 +21,13 @@ UNifSkeletalMeshFactoryOld::UNifSkeletalMeshFactoryOld()
 {
     bEditorImport = true;
     SupportedClass = USkeletalMesh::StaticClass();
-    Formats.Add(TEXT("nif;Gamebryo NIF"));
+    //Formats.Add(TEXT("nif;NIF File"));
 }
 
 bool UNifSkeletalMeshFactoryOld::FactoryCanImport(const FString& Filename)
 {
-    return Filename.EndsWith(TEXT(".nif"), ESearchCase::IgnoreCase);
+    //return Filename.EndsWith(TEXT(".nif"), ESearchCase::IgnoreCase);
+    return false;
 }
 
 // Create a unique package under the same folder as the selected destination
