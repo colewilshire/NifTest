@@ -27,6 +27,21 @@ static UPackage* MakeAssetPackage(const FString& BasePath, const FString& AssetN
 	return CreatePackage(*PackageName);
 }
 
+// Given tangent, bitangent, and normal from NIF data, produce an Unreal-compatible tangent
+static FVector4f MakeUnrealTangent(const FVector3f& Tangent, const FVector3f& Bitangent, const FVector3f& Normal)
+{
+	// Ensure all are normalized
+	FVector3f T = Tangent.GetSafeNormal();
+	FVector3f B = Bitangent.GetSafeNormal();
+	FVector3f N = Normal.GetSafeNormal();
+
+	// Calculate handedness: +1 if B matches cross(N,T), -1 if opposite
+	float Handedness = (FVector3f::DotProduct(FVector3f::CrossProduct(N, T), B) < 0.0f) ? -1.0f : 1.0f;
+
+	// Unreal packs XYZ in Tangent, and W as sign of bitangent
+	return FVector4f(T.X, T.Y, T.Z, Handedness);
+}
+
 UNifSkeletalMeshFactory::UNifSkeletalMeshFactory()
 {
 	SupportedClass = USkeletalMesh::StaticClass();
@@ -121,7 +136,7 @@ UNifSkeletalMeshFactory::FNifReferenceSkeleton UNifSkeletalMeshFactory::ParseNif
 		}
 	}
 
-	for (int i = 0; i < Skeleton.BoneNames.Num(); i++)
+	/*for (int i = 0; i < Skeleton.BoneNames.Num(); i++)
 	{
 		UE_LOG(LogTemp, Log, TEXT("[NIF] Name: %s"), *Skeleton.BoneNames[i].ToString());
 		UE_LOG(LogTemp, Log, TEXT("[NIF] Index: %d"), i);
@@ -130,6 +145,53 @@ UNifSkeletalMeshFactory::FNifReferenceSkeleton UNifSkeletalMeshFactory::ParseNif
 			*Skeleton.RefPose[i].GetLocation().ToString(),
 			*Skeleton.RefPose[i].GetRotation().Rotator().ToString(),
 			*Skeleton.RefPose[i].GetScale3D().ToString());
+	}*/
+
+	//std::map<NiNodeRef, std::vector<NiTriShapeRef>> TriShapesByLOD;
+	//for (const NiObjectRef& Object : NifList)
+	//{
+	//	const NiTriShapeRef& TriShape = DynamicCast<NiTriShape>(Object);
+	//	if (TriShape)
+	//	{
+	//		const NiNodeRef& LOD = FindFirstAncestorThatIsALOD(TriShape->GetParent());	// NiLODNodeRef->GetChildre() is numerically indexed, so perhaps this is how LOD order is determined
+	//		if (LOD)	// The shadow NiTriShape in dyn_patron is not under a LOD, but the ones in Horse are, meaning the former will return null
+	//		{			// It is unclear how to define a shadow. Perhaps NiTriShape lacking a NiTexturingProperty could work, although that may be too broad. NiStencilProperty? NiZBufferProperty?
+	//			TriShapesByLOD[LOD].push_back(TriShape);
+	//			// TriShape->GetData()->GetNormals();	//GetData seems to give us most of the data we need for the first step
+	//		}
+	//	}
+	//}
+
+	std::map <NiNodeRef, std::vector<NiTriShapeRef>> Map;
+	std::vector<std::vector<NiTriShapeRef>> qwerty;	// The LODs themselves don't hold much info but their names and childre, so we could ditch their pointer and just identify by index
+	for (const NiObjectRef& Object : NifList)
+	{
+		const NiLODNodeRef& LODNode = DynamicCast<NiLODNode>(Object);
+		if (LODNode)
+		{
+			// This should only return valid LODs. NiRangeLODData is a property, not a child, and any other NiNode would erroneously be considered a LOD by NiRangeLODData if it was a child of NiLODNode.
+			for (const NiAVObjectRef& Child : LODNode->GetChildren())
+			{
+				const NiNodeRef& LOD = DynamicCast<NiNode>(Child);
+				if (LOD)
+				{
+					GetDescendantTriShapes(LOD, Map[LOD]);
+				}
+			}
+			break;	// There should only be one NiLODNode per NIF
+		}
+	}
+
+	for (const auto& Pair : Map)
+	{
+		FString s = UTF8_TO_TCHAR(Pair.first->GetIDString().c_str());
+		UE_LOG(LogTemp, Log, TEXT("[NIF] IDString: %s"), *s);
+
+		for (const auto& Child : Pair.second)
+		{
+			FString t = UTF8_TO_TCHAR(Child->GetIDString().c_str());
+			UE_LOG(LogTemp, Log, TEXT("	[NIF] IDString: %s"), *t);
+		}
 	}
 
 	return Skeleton;
@@ -137,14 +199,14 @@ UNifSkeletalMeshFactory::FNifReferenceSkeleton UNifSkeletalMeshFactory::ParseNif
 
 UNifSkeletalMeshFactory::FNifReferenceSkeleton UNifSkeletalMeshFactory::ParseNifSkeleton(const NiNodeRef& Bone, const int32 PreviousIndex, const int32 ParentIndex, UNifSkeletalMeshFactory::FNifReferenceSkeleton Skeleton)
 {
-	Vector3 location = Bone->GetLocalTranslation();
-	Quaternion rotation = Bone->GetLocalRotation().AsQuaternion();
-	float scale = Bone->GetLocalScale();
+	const Vector3 Location = Bone->GetLocalTranslation();
+	const Quaternion Rotation = Bone->GetLocalRotation().AsQuaternion();
+	const float Scale = Bone->GetLocalScale();
 
 	FTransform transform;
-	transform.SetLocation(FVector(location.x, location.y, location.z));
-	transform.SetRotation(FQuat(rotation.x, rotation.y, rotation.z, rotation.w));
-	transform.SetScale3D(FVector(scale));
+	transform.SetLocation(FVector(Location.x, Location.y, Location.z));
+	transform.SetRotation(FQuat(Rotation.x, Rotation.y, Rotation.z, Rotation.w));
+	transform.SetScale3D(FVector(Scale));
 
 	FName boneName = Bone->GetName().c_str();
 	Skeleton.BoneNames.Add(boneName);
@@ -163,127 +225,78 @@ UNifSkeletalMeshFactory::FNifReferenceSkeleton UNifSkeletalMeshFactory::ParseNif
 	return Skeleton;
 }
 
-// Find NiTriShape, a child of a LOD
-// Its child NiTriShapeData contains the mesh triangles, while its other child NiSkinInstance contains the bones
-
-std::map<NiNodeRef, std::vector<NiTriShapeRef>> UNifSkeletalMeshFactory::GetNiTriShapes(const FString& Filename)
+UNifSkeletalMeshFactory::FNifLODGeometry UNifSkeletalMeshFactory::ParseNifLODGeometry(const vector<NiTriShapeRef>& LODTriShapes)
 {
-	std::vector<NiObjectRef> nifList = ReadNifList(TCHAR_TO_UTF8(*Filename));
-	std::vector<NiTriShapeRef> niTriShapeList;
+	UNifSkeletalMeshFactory::FNifLODGeometry LODGeometry;
 
-	// Get all NiTriShapes in the Nif tree
-	for (const NiObjectRef& niObjectRef : nifList)
+	for (const NiTriShapeRef& TriShape : LODTriShapes)
 	{
-		NiTriShapeRef niTriShapeRef = DynamicCast<NiTriShape>(niObjectRef);
-		if (niTriShapeRef)
+		const NiGeometryDataRef& GeometryData = TriShape->GetData();
+		if (GeometryData)
 		{
-			niTriShapeList.push_back(niTriShapeRef);
+			const std::vector<Vector3>& Vertices = GeometryData->GetVertices();
+			const std::vector<Vector3>& Tangents = GeometryData->GetTangents();
+			const std::vector<Vector3>& Bitangents = GeometryData->GetBitangents();
+			const std::vector<Vector3>& Normals = GeometryData->GetNormals();
+			const std::vector<TexCoord>& UVSet = GeometryData->GetUVSet(0);	// Need to null handle index, and figure out how to derive it programmatically
+
+			for (int i = 0; i < Vertices.size(); i++)
+			{
+				FVector3f Position = { Vertices[i].x, Vertices[i].y, Vertices[i].z };
+				FVector2f UV = { UVSet[i].u, UVSet[i].v};
+				FVector3f Tangent = { Tangents[i].x, Tangents[i].y, Tangents[i].z };
+				FVector3f Bitangent = { Bitangents[i].x, Bitangents[i].y, Bitangents[i].z };
+				FVector3f Normal = { Normals[i].x, Normals[i].y, Normals[i].z };
+				FVector4f UnrealTangent = MakeUnrealTangent(Tangent, Bitangent, Normal);
+
+				LODGeometry.Positions.Add(Position);
+				LODGeometry.Normals.Add(Normal);
+				LODGeometry.Tangents.Add(UnrealTangent);
+
+				// Handle vertex colors (NifShapeData has a property for if vertex colors are used or not
+			}
+
+			for (const int& Index : GeometryData->GetVertexIndices())
+			{
+				LODGeometry.Indices.Add(Index);
+			}
 		}
 	}
 
-	// Search ancestors for LODs
-	std::map<NiNodeRef, std::vector<NiTriShapeRef>> lods;
-	for (const NiTriShapeRef& niTriShapeRef : niTriShapeList)
-	{
-		NiNodeRef ancestorLOD = FindFirstAncestorThatIsALod(niTriShapeRef->GetParent());
-
-		if (ancestorLOD)
-		{
-			lods[ancestorLOD].push_back(niTriShapeRef);
-		}
-	}
-
-	return lods;	// TODO: Return here; clean up code below
-
-	// If no LODs were found, we can assume all NiTriShapes are part of LOD0
-	//if (lods.empty())	//TODO: Handle no LODs
-	//{
-
-	//}
-
-	// NiTriShapeData
-	//for (std::pair<NiNodeRef, std::vector<NiTriShapeRef>> pair : lods)
-	//{
-	//	for (NiTriShapeRef& niTriShapeRef : pair.second)
-	//	{
-	//		GetNifSkeleton(niTriShapeRef);
-	//		break;	//TODO: Handle other LODs
-	//	}
-	//	break;	//TODO: Handle Other LODs
-	//}
+	return LODGeometry;
 }
 
-NiNodeRef UNifSkeletalMeshFactory::FindFirstAncestorThatIsALod(const NiNodeRef& niNodeRef)
+std::vector<NiTriShapeRef> UNifSkeletalMeshFactory::GetDescendantTriShapes(const NiNodeRef& Parent, std::vector<NiTriShapeRef>& FoundTriShapes)
 {
-	if (!niNodeRef) { return NULL; }
-	NiNodeRef parent = niNodeRef->GetParent();
-
-	if (!parent) { return NULL; }	// There are no more valid ancestors, so there must be no LOD
-	if (DynamicCast<NiLODNode>(parent)) { return niNodeRef; }	// This NiNode's parent is an NiLODNode, therefore it must be a LOD
-
-	return FindFirstAncestorThatIsALod(parent);	// Recurse up the Nif tree
-}
-
-UNifSkeletalMeshFactory::FNifReferenceSkeleton UNifSkeletalMeshFactory::GetNifSkeleton(const NiTriShapeRef& niTriShapeRef)
-{
-	FString s = UTF8_TO_TCHAR(niTriShapeRef->GetIDString().c_str());
-	UE_LOG(LogTemp, Log, TEXT("[NIF] IDString: %s"), *s);
-	NiSkinInstanceRef niSkinInstanceRef = niTriShapeRef->GetSkinInstance();
-	FString t = UTF8_TO_TCHAR(niSkinInstanceRef->GetIDString().c_str());
-	UE_LOG(LogTemp, Log, TEXT("[NIF] IDString: %s"), *t);
-	std::vector<NiNodeRef> bones = niTriShapeRef->GetSkinInstance()->GetBones();	// GetSkeletalRoot, then iterating through children may be the way to go, as we are missing the thing called "root"
-	//TArray<FName> boneNames;										// We could theoretically just use that to get the real root, but I believe there is a NiNode between the node called Root, and "hip" (the real root?)
-	//TArray<int32> parentIndices;									// I also doubt static meshes like Bull even have an NiSkinInstance
-	//TArray<FTransform> refPose;
-	UNifSkeletalMeshFactory::FNifReferenceSkeleton referenceSkeleton;
-	TMap<FName, int32> parentLookupTable;
-
-	UE_LOG(LogTemp, Log, TEXT("[NIF] Bones Count: %d"), bones.size());
-
-	for (int i = 0; i < bones.size(); i++)
+	for (const NiAVObjectRef& Child : Parent->GetChildren())
 	{
-		Vector3 location = bones[i]->GetLocalTranslation();
-		Quaternion rotation = bones[i]->GetLocalRotation().AsQuaternion();
-		float scale = bones[i]->GetLocalScale();
-
-		FTransform transform;
-		transform.SetLocation(FVector(location.x, location.y, location.z));
-		transform.SetRotation(FQuat(rotation.x, rotation.y, rotation.z, rotation.w));
-		transform.SetScale3D(FVector(scale));
-
-		FName boneName = bones[i]->GetName().c_str();
-		referenceSkeleton.BoneNames.Add(boneName);
-		referenceSkeleton.RefPose.Add(transform);
-		parentLookupTable.Add(boneName, i);
-
-		if (i != 0)
+		const NiTriShapeRef& TriShape = DynamicCast<NiTriShape>(Child);
+		if (TriShape)
 		{
-			NiNodeRef parent = bones[i]->GetParent();
-			FName parentName = parent->GetName().c_str();
-			int32 parentIndex = *parentLookupTable.Find(parentName);
-			referenceSkeleton.ParentIndices.Add(parentIndex);
+			FoundTriShapes.push_back(TriShape);
 		}
 		else
 		{
-			referenceSkeleton.ParentIndices.Add(-1);	// The root bone should always have a parent index of -1
+			const NiNodeRef& Node = DynamicCast<NiNode>(Child);
+			if (Node)
+			{
+				FoundTriShapes = GetDescendantTriShapes(Node, FoundTriShapes);
+			}
 		}
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[NIF] SkelBones Count: %d"), referenceSkeleton.BoneNames.Num());
+	return FoundTriShapes;
+}
 
-	for (int i = 0; i < referenceSkeleton.BoneNames.Num(); i++)
-	{
-		UE_LOG(LogTemp, Log, TEXT("[NIF] Name: %s"), *referenceSkeleton.BoneNames[i].ToString());
-		UE_LOG(LogTemp, Log, TEXT("[NIF] Index: %d"), i);
-		UE_LOG(LogTemp, Log, TEXT("[NIF] Parent: %d"), referenceSkeleton.ParentIndices[i]);
-		UE_LOG(LogTemp, Log, TEXT("Transform - Location: %s, Rotation: %s, Scale: %s"),
-			*referenceSkeleton.RefPose[i].GetLocation().ToString(),
-			*referenceSkeleton.RefPose[i].GetRotation().Rotator().ToString(),
-			*referenceSkeleton.RefPose[i].GetScale3D().ToString());
-	}
+NiNodeRef UNifSkeletalMeshFactory::FindFirstAncestorThatIsALOD(const NiNodeRef& Node)
+{
+	if (!Node) { return NULL; }
+	NiNodeRef Parent = Node->GetParent();
 
-	//BuildReferenceSkeleton(referenceSkeleton.BoneNames, parentIndices, refPose);
-	return referenceSkeleton;
+	if (!Parent) { return NULL; }	// There are no more valid ancestors, so there must be no LOD
+	if (DynamicCast<NiLODNode>(Parent)) { return Node; }	// This NiNode's parent is an NiLODNode, therefore it must be a LOD
+
+	return FindFirstAncestorThatIsALOD(Parent);	// Recurse up the Nif tree
 }
 
 FReferenceSkeleton UNifSkeletalMeshFactory::BuildReferenceSkeleton(

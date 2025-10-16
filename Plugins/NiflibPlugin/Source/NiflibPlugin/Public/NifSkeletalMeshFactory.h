@@ -40,11 +40,20 @@ private:
 		TArray<int32> ParentIndices;
 		TArray<FTransform> RefPose;
 	};
+	struct FNifLODGeometry
+	{
+		TArray<FVector3f> Positions;
+		TArray<uint32> Indices;
+		TArray<FVector3f> Normals;
+		TArray<FVector4f> Tangents;
+		TArray<FVector2f> UVs;
+		TArray<FColor> VertexColors;
+	};
 
 	FNifReferenceSkeleton ParseNif(const FString& Filename);
 	FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& NextBone, const int32 PreviousIndex = -1, const int32 ParentIndex = -1, const UNifSkeletalMeshFactory::FNifReferenceSkeleton Skeleton = {});
-	std::map<Niflib::NiNodeRef, std::vector<Niflib::NiTriShapeRef>> GetNiTriShapes(const FString& Filename);
-	Niflib::NiNodeRef FindFirstAncestorThatIsALod(const Niflib::NiNodeRef& niNodeRef);
-	FNifReferenceSkeleton GetNifSkeleton(const Niflib::NiTriShapeRef& niTriShapeRef);
+	FNifLODGeometry ParseNifLODGeometry(const vector<NiTriShapeRef>& LODTriShapes);
+	std::vector<NiTriShapeRef> GetDescendantTriShapes(const NiNodeRef& LOD, std::vector<NiTriShapeRef>& FoundTriShapes);
+	NiNodeRef FindFirstAncestorThatIsALOD(const NiNodeRef& Node);
 	FReferenceSkeleton BuildReferenceSkeleton(const TArray<FName>& BoneNames, const TArray<int32>& ParentIndices, const TArray<FTransform>& RefPose);
 };
