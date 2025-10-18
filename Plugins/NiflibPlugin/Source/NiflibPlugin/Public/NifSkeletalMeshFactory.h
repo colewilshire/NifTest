@@ -50,10 +50,7 @@ private:
 		TArray<FColor> VertexColors;
 	};
 
-	FNifReferenceSkeleton ParseNif(const FString& Filename);
-	FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& NextBone, const int32 PreviousIndex = -1, const int32 ParentIndex = -1, const UNifSkeletalMeshFactory::FNifReferenceSkeleton Skeleton = {});
 	FNifLODGeometry ParseNifLODGeometry(const vector<NiTriShapeRef>& LODTriShapes);
 	std::vector<NiTriShapeRef> GetDescendantTriShapes(const NiNodeRef& LOD, std::vector<NiTriShapeRef>& FoundTriShapes);
 	NiNodeRef FindFirstAncestorThatIsALOD(const NiNodeRef& Node);
-	FReferenceSkeleton BuildReferenceSkeleton(const TArray<FName>& BoneNames, const TArray<int32>& ParentIndices, const TArray<FTransform>& RefPose);
 };

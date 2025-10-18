@@ -233,10 +233,10 @@ struct FNifReferenceSkeleton
 	TArray<FTransform> RefPose;
 };
 
-static FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& Bone, const int32 PreviousIndex = -1, const int32 ParentIndex = -1, FNifReferenceSkeleton Skeleton = {})
+static FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& Bone, const int32 ParentIndex = -1, FNifReferenceSkeleton Skeleton = {})
 {
 	const Vector3 Location = Bone->GetLocalTranslation();
-	const Quaternion Rotation = Bone->GetLocalRotation().AsQuaternion();
+	Quaternion Rotation = Bone->GetLocalRotation().AsQuaternion();
 	const float Scale = Bone->GetLocalScale();
 
 	FTransform Transform;
@@ -249,12 +249,13 @@ static FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& Bone, const int32
 	Skeleton.ParentIndices.Add(ParentIndex);
 	Skeleton.RefPose.Add(Transform);
 
+	const int32 CurrentBoneIndex = Skeleton.BoneNames.Num() - 1;
 	for (const NiAVObjectRef& Child : Bone->GetChildren())
 	{
 		NiNodeRef NextBone = DynamicCast<NiNode>(Child);
 		if (NextBone)
 		{
-			Skeleton = ParseNifSkeleton(NextBone, PreviousIndex + 1, ParentIndex + 1, Skeleton);
+			Skeleton = ParseNifSkeleton(NextBone, CurrentBoneIndex, Skeleton);
 		}
 	}
 
@@ -279,7 +280,7 @@ static FReferenceSkeleton BuildReferenceSkeleton(
 	return RefSkeleton;
 }
 
-static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
+static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 {
 	FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
 	ImportedModel->LODModels.Add(new FSkeletalMeshLODModel());
@@ -314,6 +315,8 @@ static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 		if (TriShape)
 		{
 			const FReferenceSkeleton& ReferenceSkeleton = BuildReferenceSkeleton(NifSkeleton.BoneNames, NifSkeleton.ParentIndices, NifSkeleton.RefPose);
+			SkeletalMesh->SetRefSkeleton(ReferenceSkeleton);
+
 			const TArray<SkeletalMeshImportData::FVertInfluence>& VertexInfluences = GetVertexInfluences(TriShape->GetSkinInstance(), MultiTargetTransformController);
 			const TArray<SkeletalMeshImportData::FMeshWedge>& MeshWedges = GetMeshWedges(TriShape->GetData());
 			const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = BuildFacesFromWedges(MeshWedges);//GetMeshFaces(TriShape->GetData());
@@ -391,6 +394,29 @@ static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 				}
 			}
 			UE_LOG(LogTemp, Log, TEXT("Preflight: DegenerateFaces=%d"), DegenerateFaceCount);
+
+			// Bones
+			{
+				const int32 Count = FMath::Min3(NifSkeleton.BoneNames.Num(), NifSkeleton.ParentIndices.Num(), NifSkeleton.RefPose.Num());
+				UE_LOG(LogTemp, Log, TEXT("RefSkeleton: Bones=%d (Names=%d, Parents=%d, RefPose=%d)"),
+					Count, NifSkeleton.BoneNames.Num(), NifSkeleton.ParentIndices.Num(), NifSkeleton.RefPose.Num());
+
+				for (int32 i = 0; i < Count; ++i)
+				{
+					const FVector   L = NifSkeleton.RefPose[i].GetLocation();
+					const FRotator  R = NifSkeleton.RefPose[i].GetRotation().Rotator();
+					const FVector   S = NifSkeleton.RefPose[i].GetScale3D();
+
+					UE_LOG(LogTemp, Log,
+						TEXT("[Bone %d] Name=%s  Parent=%d  Loc=(%.3f,%.3f,%.3f)  Rot=%s  Scale=(%.3f,%.3f,%.3f)"),
+						i,
+						*NifSkeleton.BoneNames[i].ToString(),
+						NifSkeleton.ParentIndices[i],
+						L.X, L.Y, L.Z,
+						*R.ToCompactString(),
+						S.X, S.Y, S.Z);
+				}
+			}
 
 			// Influence coverage summary
 			TArray<float> WeightSums;
@@ -531,11 +557,10 @@ static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 			LODInfo->BuildSettings.bUseMikkTSpace = true;
 			//LODInfo.ScreenSize.Default = 1.0f;
 
-			/////
-			// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)
+			//// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)
 			NewLODModel->NumTexCoords = FMath::Max<uint32>(NewLODModel->NumTexCoords, 1u);
 
-			// Materials slots (minimum)
+			//// Materials slots (minimum)
 			int32 MaxSectionMatIndex = -1;
 			for (const FSkelMeshSection& Sec : NewLODModel->Sections)
 				MaxSectionMatIndex = FMath::Max(MaxSectionMatIndex, (int32)Sec.MaterialIndex);
@@ -544,7 +569,7 @@ static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 				while (SkeletalMesh->GetMaterials().Num() <= MaxSectionMatIndex)
 					SkeletalMesh->GetMaterials().Add(FSkeletalMaterial());
 
-			// Bounds (from this LOD’s points)
+			//// Bounds (from this LOD’s points)
 			{
 				FBox BoundsBox(ForceInit);
 				for (const FVector3f& P : Points)
@@ -552,7 +577,7 @@ static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 				if (BoundsBox.IsValid)
 					SkeletalMesh->SetImportedBounds(FBoxSphereBounds(BoundsBox));
 			}
-			/////
+			///////
 
 			break; // TODO: Remove once I can handle multiple LODs, This will only get TriShape of the LOD, not the full LOD
 		}
@@ -613,10 +638,6 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 {
 	bOutOperationCanceled = false;
 
-	// Parse NIF for mesh data
-	UNifSkeletalMeshFactory::FNifReferenceSkeleton NifReferenceSkeleton = ParseNif(Filename);
-	//Test(Filename);
-
 	// Create packages/assets
 	const FString BasePath = InParent->GetOutermost()->GetName();
 	FString SkelObjName, MeshObjName;
@@ -625,12 +646,8 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 	UPackage* MeshPkg = MakeAssetPackage(BasePath, InName.ToString(), MeshObjName);
 	USkeletalMesh* SkeletalMesh = NewObject<USkeletalMesh>(MeshPkg, *MeshObjName, RF_Public | RF_Standalone);
 
-	// Build reference skeleton
-	FReferenceSkeleton ReferenceSkeleton = BuildReferenceSkeleton(NifReferenceSkeleton.BoneNames, NifReferenceSkeleton.ParentIndices, NifReferenceSkeleton.RefPose);
-	SkeletalMesh->SetRefSkeleton(ReferenceSkeleton);
-
-	/////
-	Test(Filename, SkeletalMesh);
+	///// Parse NIF for mesh data
+	ParseNif(Filename, SkeletalMesh);
 	/////
 
 	// Build skeleton
@@ -655,120 +672,9 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 	SkeletalMesh->PostEditChange();
 
 	// Force reload to auto-generate missing MeshDescription
-	// SkeletalMesh->PostLoad();
+	//SkeletalMesh->PostLoad();
 
 	return SkeletalMesh;
-}
-
-UNifSkeletalMeshFactory::FNifReferenceSkeleton UNifSkeletalMeshFactory::ParseNif(const FString& Filename)
-{
-	std::vector<NiObjectRef> NifList = ReadNifList(TCHAR_TO_UTF8(*Filename));
-	UNifSkeletalMeshFactory::FNifReferenceSkeleton Skeleton;
-
-	for (const NiObjectRef& Object : NifList)
-	{
-		// NiSkinInstanceRef->GetSkeletalRoot() and NiSkinInstanceRef->GetBones()[0] do not reliably return the true skeletal root
-		const NiMultiTargetTransformControllerRef& TransformController = DynamicCast<NiMultiTargetTransformController>(Object);
-		if (TransformController)
-		{
-			// The target of NiMultiTargetTransformController should always be the true skeletal root, or else animations wouldn't work, I think
-			const NiObjectNETRef& TransformControllerTarget = TransformController->GetTarget();
-			const NiNodeRef& RootBone = DynamicCast<NiNode>(TransformControllerTarget);
-			if (RootBone)
-			{
-				Skeleton = ParseNifSkeleton(RootBone);
-				break;	// There should only be one NiMultiTargetTransformController, I think, so bail once it is found
-			}
-		}
-	}
-
-	/*for (int i = 0; i < Skeleton.BoneNames.Num(); i++)
-	{
-		UE_LOG(LogTemp, Log, TEXT("[NIF] Name: %s"), *Skeleton.BoneNames[i].ToString());
-		UE_LOG(LogTemp, Log, TEXT("[NIF] Index: %d"), i);
-		UE_LOG(LogTemp, Log, TEXT("[NIF] Parent: %d"), Skeleton.ParentIndices[i]);
-		UE_LOG(LogTemp, Log, TEXT("[NIF] Transform - Location: %s, Rotation: %s, Scale: %s"),
-			*Skeleton.RefPose[i].GetLocation().ToString(),
-			*Skeleton.RefPose[i].GetRotation().Rotator().ToString(),
-			*Skeleton.RefPose[i].GetScale3D().ToString());
-	}*/
-
-	//std::map<NiNodeRef, std::vector<NiTriShapeRef>> TriShapesByLOD;
-	//for (const NiObjectRef& Object : NifList)
-	//{
-	//	const NiTriShapeRef& TriShape = DynamicCast<NiTriShape>(Object);
-	//	if (TriShape)
-	//	{
-	//		const NiNodeRef& LOD = FindFirstAncestorThatIsALOD(TriShape->GetParent());	// NiLODNodeRef->GetChildre() is numerically indexed, so perhaps this is how LOD order is determined
-	//		if (LOD)	// The shadow NiTriShape in dyn_patron is not under a LOD, but the ones in Horse are, meaning the former will return null
-	//		{			// It is unclear how to define a shadow. Perhaps NiTriShape lacking a NiTexturingProperty could work, although that may be too broad. NiStencilProperty? NiZBufferProperty?
-	//			TriShapesByLOD[LOD].push_back(TriShape);
-	//			// TriShape->GetData()->GetNormals();	//GetData seems to give us most of the data we need for the first step
-	//		}
-	//	}
-	//}
-
-	std::map <NiNodeRef, std::vector<NiTriShapeRef>> Map;
-	std::vector<std::vector<NiTriShapeRef>> qwerty;	// The LODs themselves don't hold much info but their names and childre, so we could ditch their pointer and just identify by index
-	for (const NiObjectRef& Object : NifList)
-	{
-		const NiLODNodeRef& LODNode = DynamicCast<NiLODNode>(Object);
-		if (LODNode)
-		{
-			// This should only return valid LODs. NiRangeLODData is a property, not a child, and any other NiNode would erroneously be considered a LOD by NiRangeLODData if it was a child of NiLODNode.
-			for (const NiAVObjectRef& Child : LODNode->GetChildren())
-			{
-				const NiNodeRef& LOD = DynamicCast<NiNode>(Child);
-				if (LOD)
-				{
-					GetDescendantTriShapes(LOD, Map[LOD]);
-				}
-			}
-			break;	// There should only be one NiLODNode per NIF
-		}
-	}
-
-	/*for (const auto& Pair : Map)
-	{
-		FString s = UTF8_TO_TCHAR(Pair.first->GetIDString().c_str());
-		UE_LOG(LogTemp, Log, TEXT("[NIF] IDString: %s"), *s);
-
-		for (const auto& Child : Pair.second)
-		{
-			FString t = UTF8_TO_TCHAR(Child->GetIDString().c_str());
-			UE_LOG(LogTemp, Log, TEXT("	[NIF] IDString: %s"), *t);
-		}
-	}*/
-
-	return Skeleton;
-}
-
-UNifSkeletalMeshFactory::FNifReferenceSkeleton UNifSkeletalMeshFactory::ParseNifSkeleton(const NiNodeRef& Bone, const int32 PreviousIndex, const int32 ParentIndex, UNifSkeletalMeshFactory::FNifReferenceSkeleton Skeleton)
-{
-	const Vector3 Location = Bone->GetLocalTranslation();
-	const Quaternion Rotation = Bone->GetLocalRotation().AsQuaternion();
-	const float Scale = Bone->GetLocalScale();
-
-	FTransform transform;
-	transform.SetLocation(FVector(Location.x, Location.y, Location.z));
-	transform.SetRotation(FQuat(Rotation.x, Rotation.y, Rotation.z, Rotation.w));
-	transform.SetScale3D(FVector(Scale));
-
-	FName boneName = Bone->GetName().c_str();
-	Skeleton.BoneNames.Add(boneName);
-	Skeleton.ParentIndices.Add(ParentIndex);
-	Skeleton.RefPose.Add(transform);
-
-	for (const NiAVObjectRef& Child : Bone->GetChildren())
-	{
-		NiNodeRef NextBone = DynamicCast<NiNode>(Child);
-		if (NextBone)
-		{
-			Skeleton = ParseNifSkeleton(NextBone, PreviousIndex + 1, ParentIndex + 1, Skeleton);
-		}
-	}
-
-	return Skeleton;
 }
 
 UNifSkeletalMeshFactory::FNifLODGeometry UNifSkeletalMeshFactory::ParseNifLODGeometry(const vector<NiTriShapeRef>& LODTriShapes)
@@ -843,22 +749,4 @@ NiNodeRef UNifSkeletalMeshFactory::FindFirstAncestorThatIsALOD(const NiNodeRef& 
 	if (DynamicCast<NiLODNode>(Parent)) { return Node; }	// This NiNode's parent is an NiLODNode, therefore it must be a LOD
 
 	return FindFirstAncestorThatIsALOD(Parent);	// Recurse up the Nif tree
-}
-
-FReferenceSkeleton UNifSkeletalMeshFactory::BuildReferenceSkeleton(
-	const TArray<FName>& BoneNames,
-	const TArray<int32>& ParentIndices,
-	const TArray<FTransform>& RefPose)
-{
-	FReferenceSkeleton RefSkeleton(true);
-	FReferenceSkeletonModifier Mod(RefSkeleton, nullptr);
-
-	const int32 NumBones = BoneNames.Num();
-	for (int32 i = 0; i < NumBones; ++i)
-	{
-		FMeshBoneInfo BoneInfo(BoneNames[i], FString(), ParentIndices[i]);
-		Mod.Add(BoneInfo, RefPose[i], false);
-	}
-
-	return RefSkeleton;
 }
