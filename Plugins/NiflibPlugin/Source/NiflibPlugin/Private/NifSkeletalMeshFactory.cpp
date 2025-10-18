@@ -65,36 +65,77 @@ static TArray<SkeletalMeshImportData::FVertInfluence> GetVertexInfluences(const 
 	return VertexInfluences;
 }
 
+//static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const NiGeometryDataRef& GeometryData)
+//{
+//	const std::vector<Vector3>& Vertices = GeometryData->GetVertices();
+//	const std::vector<Color4>& Colors = GeometryData->GetColors();
+//	TArray<SkeletalMeshImportData::FMeshWedge> MeshWedges;
+//
+//	for (int VertexIndex = 0; VertexIndex < Vertices.size(); VertexIndex++)
+//	{
+//		SkeletalMeshImportData::FMeshWedge MeshWedge = {};
+//		MeshWedge.iVertex = VertexIndex;
+//
+//		for (int i = 0; i < GeometryData->GetUVSetCount(); i++)
+//		{
+//			const std::vector<TexCoord>& UVSet = GeometryData->GetUVSet(i);
+//			const FVector2f UV = { UVSet[VertexIndex].u, UVSet[VertexIndex].v};
+//			MeshWedge.UVs[i] = UV;
+//		}
+//
+//		if (!Colors.empty())
+//		{
+//			const FColor Color(
+//				(uint8)(Colors[VertexIndex].r * 255.0f),
+//				(uint8)(Colors[VertexIndex].g * 255.0f),
+//				(uint8)(Colors[VertexIndex].b * 255.0f),
+//				(uint8)(Colors[VertexIndex].a * 255.0f)
+//			);
+//			MeshWedge.Color = Color;
+//		}
+//
+//		MeshWedges.Add(MeshWedge);
+//	}
+//
+//	return MeshWedges;
+//}
+
 static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const NiGeometryDataRef& GeometryData)
 {
-	const std::vector<Vector3>& Vertices = GeometryData->GetVertices();
-	const std::vector<Color4>& Colors = GeometryData->GetColors();
+	const NiTriShapeDataRef& TriShapeData = DynamicCast<NiTriShapeData>(GeometryData);
+	const std::vector<Triangle>& Triangles = TriShapeData->GetTriangles();
+	const std::vector<Color4>& Colors = TriShapeData->GetColors();
 	TArray<SkeletalMeshImportData::FMeshWedge> MeshWedges;
 
-	for (int VertexIndex = 0; VertexIndex < Vertices.size(); VertexIndex++)
+	for (int TriangleIndex = 0; TriangleIndex < Triangles.size(); TriangleIndex++)
 	{
-		SkeletalMeshImportData::FMeshWedge MeshWedge = {};
-		MeshWedge.iVertex = VertexIndex;
+		SkeletalMeshImportData::FMeshWedge MeshWedge[3] = {};
+		MeshWedge[0].iVertex = Triangles[TriangleIndex].v1;
+		MeshWedge[1].iVertex = Triangles[TriangleIndex].v2;
+		MeshWedge[2].iVertex = Triangles[TriangleIndex].v3;
 
-		for (int i = 0; i < GeometryData->GetUVSetCount(); i++)
+		for (int i = 0; i < std::size(MeshWedge); i++)
 		{
-			const std::vector<TexCoord>& UVSet = GeometryData->GetUVSet(i);
-			const FVector2f UV = { UVSet[VertexIndex].u, UVSet[VertexIndex].v};
-			MeshWedge.UVs[i] = UV;
-		}
+			for (int j = 0; j < TriShapeData->GetUVSetCount(); j++)
+			{
+				const std::vector<TexCoord>& UVSet = TriShapeData->GetUVSet(j);
+				const FVector2f UV = { UVSet[MeshWedge[i].iVertex].u, UVSet[MeshWedge[i].iVertex].v };
+				MeshWedge[i].UVs[j] = UV;
+			}
 
-		if (!Colors.empty())
-		{
-			const FColor Color(
-				(uint8)(Colors[VertexIndex].r * 255.0f),
-				(uint8)(Colors[VertexIndex].g * 255.0f),
-				(uint8)(Colors[VertexIndex].b * 255.0f),
-				(uint8)(Colors[VertexIndex].a * 255.0f)
-			);
-			MeshWedge.Color = Color;
-		}
+			if (!Colors.empty())
+			{
+				const FColor Color(
+					(uint8)(Colors[MeshWedge[i].iVertex].r * 255.0f),
+					(uint8)(Colors[MeshWedge[i].iVertex].g * 255.0f),
+					(uint8)(Colors[MeshWedge[i].iVertex].b * 255.0f),
+					(uint8)(Colors[MeshWedge[i].iVertex].a * 255.0f)
+				);
+				MeshWedge[i].Color = Color;
+			}
 
-		MeshWedges.Add(MeshWedge);
+			MeshWedges.Add(MeshWedge[i]);
+		}
 	}
 
 	return MeshWedges;
@@ -251,7 +292,7 @@ static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 	FSkeletalMeshLODModel* NewLODModel = &ImportedModel->LODModels[0];*/
 
 	std::vector<NiObjectRef> NifList = ReadNifList(TCHAR_TO_UTF8(*Filename));
-	IMeshUtilities& MeshUtilities = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
+	//IMeshUtilities& MeshUtilities = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
 	NiMultiTargetTransformControllerRef MultiTargetTransformController;
 	FNifReferenceSkeleton NifSkeleton;
 
