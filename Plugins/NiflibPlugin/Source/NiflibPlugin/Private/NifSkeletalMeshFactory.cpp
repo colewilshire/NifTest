@@ -9,7 +9,9 @@
 #include "ReferenceSkeleton.h"
 #include "AssetToolsModule.h"
 #include "AssetRegistry/AssetRegistryModule.h"
-#include <Rendering/SkeletalMeshLODImporterData.h>
+#include "MeshUtilities.h"
+#include "Rendering/SkeletalMeshModel.h"
+#include "Rendering/SkeletalMeshLODImporterData.h"
 
 // Niflib
 #include <niflib.h>
@@ -41,6 +43,28 @@ static TArray<SkeletalMeshImportData::FRawBoneInfluence> GetRawBoneInfluences(co
 	return RawBoneInfluences;
 }
 
+static TArray<SkeletalMeshImportData::FVertInfluence> GetVertexInfluences(const NiSkinInstanceRef& SkinInstance, const NiMultiTargetTransformControllerRef& MultiTargetTransformController)
+{
+	const std::vector<NiNodeRef>& Bones = SkinInstance->GetBones();
+	const NiSkinDataRef& SkinData = SkinInstance->GetSkinData();
+	const int TrueBoneCount = MultiTargetTransformController->GetExtraTargets().size() + 1;	//GetExtraTargets dose not cover the Target Bone, so increment by 1.
+	const int InfluencelessBoneCount = TrueBoneCount - SkinInstance->GetBoneCount();
+	TArray<SkeletalMeshImportData::FVertInfluence> VertexInfluences;
+
+	// An NiSkinData only tracks the bones it influences, so we must offset the starting index by the difference between all bones and those influence by the skin.
+	for (int BoneIndex = 0; BoneIndex < Bones.size(); BoneIndex++)
+	{
+		const std::vector<SkinWeight>& SkinWeights = SkinData->GetBoneWeights(BoneIndex);
+		for (SkinWeight SkinWeight : SkinWeights)
+		{
+			SkeletalMeshImportData::FVertInfluence VertexInfluence{ SkinWeight.weight, SkinWeight.index, BoneIndex + InfluencelessBoneCount };
+			VertexInfluences.Add(VertexInfluence);
+		}
+	}
+
+	return VertexInfluences;
+}
+
 static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const NiGeometryDataRef& GeometryData)
 {
 	const std::vector<Vector3>& Vertices = GeometryData->GetVertices();
@@ -61,7 +85,12 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const NiGeometry
 
 		if (!Colors.empty())
 		{
-			FColor Color = { Colors[VertexIndex].b, Colors[VertexIndex].g, Colors[VertexIndex].r, Colors[VertexIndex].a };
+			const FColor Color(
+				(uint8)(Colors[VertexIndex].r * 255.0f),
+				(uint8)(Colors[VertexIndex].g * 255.0f),
+				(uint8)(Colors[VertexIndex].b * 255.0f),
+				(uint8)(Colors[VertexIndex].a * 255.0f)
+			);
 			MeshWedge.Color = Color;
 		}
 
@@ -71,9 +100,9 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const NiGeometry
 	return MeshWedges;
 }
 
-static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const NiTriShapeRef& TriShape)
+static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const NiGeometryDataRef& GeometryData)
 {
-	const NiTriShapeDataRef& TriShapeData = DynamicCast<NiTriShapeData>(TriShape->GetData());
+	const NiTriShapeDataRef& TriShapeData = DynamicCast<NiTriShapeData>(GeometryData);
 	const std::vector<Triangle>& Triangles = TriShapeData->GetTriangles();
 	const std::vector<Vector3>& Tangents = TriShapeData->GetTangents();
 	const std::vector<Vector3>& Bitangents = TriShapeData->GetBitangents();
@@ -84,6 +113,9 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const NiTriShapeRe
 	{
 		SkeletalMeshImportData::FMeshFace MeshFace = {};
 		const uint32 VertexIndices[3] = { Triangle.v1, Triangle.v2, Triangle.v3 };
+
+		MeshFace.MeshMaterialIndex = 0;
+		MeshFace.SmoothingGroups = 0;
 
 		for (int i = 0; i < std::size(VertexIndices); i++)
 		{
@@ -99,57 +131,221 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const NiTriShapeRe
 
 		MeshFaces.Add(MeshFace);
 	}
-	const NiPropertyRef& Property = TriShape->GetPropertyByType(NiMaterialProperty::TYPE);
-	const auto& MaterialProperty = DynamicCast<NiMaterialProperty>(Property);
+	/*const NiPropertyRef& Property = TriShape->GetPropertyByType(NiMaterialProperty::TYPE);
+	const NiMaterialPropertyRef& MaterialProperty = DynamicCast<NiMaterialProperty>(Property);
+	MaterialProperty->get*/
 
 	return MeshFaces;
 }
 
-static SkeletalMeshImportData::FMeshFace GetMeshFace()
+static TArray<FVector3f> GetPoints(const NiGeometryDataRef& GeometryData)
 {
-	SkeletalMeshImportData::FMeshFace MeshFace;
-	// uint32 iWedge[3];    // The 3 wedge indices making up this face
-	// uint16 MeshMaterialIndex; // Which material slot this face belongs to
-	// uint32 SmoothingGroups;   // Smoothing group for shading
-	// FVector3f TangentX[3];    // Per-corner tangent (optional at import)
-	// FVector3f TangentY[3];    // Per-corner bitangent
-	// FVector3f TangentZ[3];    // Per-corner normal
+	TArray<FVector3f> Points;
 
-	return MeshFace;
+	for (const Vector3& Vertex : GeometryData->GetVertices())
+	{
+		FVector3f Point = { Vertex.x, Vertex.y, Vertex.z };
+		Points.Add(Point);
+	}
+
+	return Points;
 }
 
-static void Test(const FString& Filename)
+static TArray<int32> GetPointsToOriginalMap(const NiGeometryDataRef& GeometryData)
 {
-	/*TriShape->GetSkinInstance()->GetSkinData()->GetBoneWeights(0)[0].
-	DynamicCast<NiTriShapeData>(TriShape->GetData())->GetTriangles()[0].
-	TriShape->GetData()->get
-	TriShape->GetSkinInstance()->GetSkinData()->GetBoneWeights(0)[0].
-	TriShape->GetSkinInstance()->GetBones()*/
+	TArray<int32> PointsToOriginalMap;
+	const std::vector<Vector3>& Vertices = GeometryData->GetVertices();
+
+	for (int i = 0; i < Vertices.size(); i++)
+	{
+		PointsToOriginalMap.Add(i);
+	}
+
+	return PointsToOriginalMap;
+}
+
+static void BuildLOD(
+	const FString& MeshName,
+	const FReferenceSkeleton& RefSkeleton,
+	const TArray<SkeletalMeshImportData::FVertInfluence>& Influences,
+	const TArray<SkeletalMeshImportData::FMeshWedge>& Wedges,
+	const TArray<SkeletalMeshImportData::FMeshFace>& Faces,
+	const TArray<FVector3f>& Points,
+	const TArray<int32>& PointsToOriginalMap,
+	const IMeshUtilities::MeshBuildOptions& BuildOptions
+)
+{
+	FSkeletalMeshLODModel LODModel;
+	IMeshUtilities& MeshUtilities = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
+
+	MeshUtilities.BuildSkeletalMesh(
+		LODModel,
+		MeshName,
+		RefSkeleton,
+		Influences,
+		Wedges,
+		Faces,
+		Points,
+		PointsToOriginalMap,
+		BuildOptions
+	);
+}
+
+struct FNifReferenceSkeleton
+{
+	TArray<FName> BoneNames;
+	TArray<int32> ParentIndices;
+	TArray<FTransform> RefPose;
+};
+
+static FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& Bone, const int32 PreviousIndex = -1, const int32 ParentIndex = -1, FNifReferenceSkeleton Skeleton = {})
+{
+	const Vector3 Location = Bone->GetLocalTranslation();
+	const Quaternion Rotation = Bone->GetLocalRotation().AsQuaternion();
+	const float Scale = Bone->GetLocalScale();
+
+	FTransform Transform;
+	Transform.SetLocation(FVector(Location.x, Location.y, Location.z));
+	Transform.SetRotation(FQuat(Rotation.x, Rotation.y, Rotation.z, Rotation.w));
+	Transform.SetScale3D(FVector(Scale));
+
+	FName BoneName = Bone->GetName().c_str();
+	Skeleton.BoneNames.Add(BoneName);
+	Skeleton.ParentIndices.Add(ParentIndex);
+	Skeleton.RefPose.Add(Transform);
+
+	for (const NiAVObjectRef& Child : Bone->GetChildren())
+	{
+		NiNodeRef NextBone = DynamicCast<NiNode>(Child);
+		if (NextBone)
+		{
+			Skeleton = ParseNifSkeleton(NextBone, PreviousIndex + 1, ParentIndex + 1, Skeleton);
+		}
+	}
+
+	return Skeleton;
+}
+
+static FReferenceSkeleton BuildReferenceSkeleton(
+	const TArray<FName>& BoneNames,
+	const TArray<int32>& ParentIndices,
+	const TArray<FTransform>& RefPose)
+{
+	FReferenceSkeleton RefSkeleton(true);
+	FReferenceSkeletonModifier Mod(RefSkeleton, nullptr);
+
+	const int32 NumBones = BoneNames.Num();
+	for (int32 i = 0; i < NumBones; ++i)
+	{
+		FMeshBoneInfo BoneInfo(BoneNames[i], FString(), ParentIndices[i]);
+		Mod.Add(BoneInfo, RefPose[i], false);
+	}
+
+	return RefSkeleton;
+}
+
+static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
+{
+	/*FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
+	ImportedModel->LODModels.Add(new FSkeletalMeshLODModel());
+	FSkeletalMeshLODModel* NewLODModel = &ImportedModel->LODModels[0];*/
 
 	std::vector<NiObjectRef> NifList = ReadNifList(TCHAR_TO_UTF8(*Filename));
+	IMeshUtilities& MeshUtilities = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
+	NiMultiTargetTransformControllerRef MultiTargetTransformController;
+	FNifReferenceSkeleton NifSkeleton;
 
 	for (const NiObjectRef& Object : NifList)
 	{
-		const NiTriShapeRef& TriShape = DynamicCast<NiTriShape>(Object);
+		// NiSkinInstanceRef->GetSkeletalRoot() and NiSkinInstanceRef->GetBones()[0] do not reliably return the true skeletal root
+		MultiTargetTransformController = DynamicCast<NiMultiTargetTransformController>(Object);
+		if (MultiTargetTransformController)
+		{
+			// The target of NiMultiTargetTransformController should always be the true skeletal root, or else animations wouldn't work, I think
+			const NiObjectNETRef& Target = MultiTargetTransformController->GetTarget();
+			const NiNodeRef& RootBone = DynamicCast<NiNode>(Target);
+			if (RootBone)
+			{
+				NifSkeleton = ParseNifSkeleton(RootBone);
+
+				break;	// There should only be one NiMultiTargetTransformController, I think, so bail once it is found.
+			}
+		}
+	}
+
+	for (const NiObjectRef& Object : NifList)
+	{
+		const NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Object);
 		if (TriShape)
 		{
-			const std::vector<NiNodeRef>& Bones = TriShape->GetSkinInstance()->GetBones();
-			const NiSkinDataRef& SkinData = TriShape->GetSkinInstance()->GetSkinData();
-			for (int i = 0; i < Bones.size(); i++)
-			{
-				UE_LOG(LogTemp, Log, TEXT("[NIF] %d"), i);
-				const std::vector<SkinWeight>& SkinWeights = SkinData->GetBoneWeights(i);
-				for (SkinWeight SkinWeight : SkinWeights)
-				{
-					UE_LOG(LogTemp, Log, TEXT("	[NIF] %hu: %.2f"), SkinWeight.index, SkinWeight.weight);
-				}
-			}
-			break;
+			const FReferenceSkeleton& ReferenceSkeleton = BuildReferenceSkeleton(NifSkeleton.BoneNames, NifSkeleton.ParentIndices, NifSkeleton.RefPose);
+			const TArray<SkeletalMeshImportData::FVertInfluence>& VertexInfluences = GetVertexInfluences(TriShape->GetSkinInstance(), MultiTargetTransformController);
+			const TArray<SkeletalMeshImportData::FMeshWedge>& MeshWedges = GetMeshWedges(TriShape->GetData());
+			const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = GetMeshFaces(TriShape->GetData());
+			const TArray<FVector3f>& Points = GetPoints(TriShape->GetData());
+			const TArray<int32>& PointsToOriginalMap = GetPointsToOriginalMap(TriShape->GetData());
+			IMeshUtilities::MeshBuildOptions BuildOptions;
 
-			TArray<int32> BoneIndices;
-			BoneIndices.SetNum(TriShape->GetData()->GetVertexCount());
-			TArray<float> Weights;
-			Weights.SetNum(TriShape->GetData()->GetVertexCount());
+			/////
+			for (int32 i = 0; i < VertexInfluences.Num(); i++)
+			{
+				const SkeletalMeshImportData::FVertInfluence& Influence = VertexInfluences[i];
+				UE_LOG(LogTemp, Log, TEXT("[Influence %d] VertexIndex=%d, BoneIndex=%d, Weight=%f"),
+					i,
+					Influence.VertIndex,
+					Influence.BoneIndex,
+					Influence.Weight);
+			}
+			for (int32 i = 0; i < MeshWedges.Num(); i++)
+			{
+				const SkeletalMeshImportData::FMeshWedge& Wedge = MeshWedges[i];
+				UE_LOG(LogTemp, Log, TEXT("[Wedge %d] iVertex=%d, UV=(%f, %f), Color=(R=%d,G=%d,B=%d,A=%d)"),
+					i,
+					Wedge.iVertex,
+					Wedge.UVs[0].X, Wedge.UVs[0].Y,
+					Wedge.Color.R, Wedge.Color.G, Wedge.Color.B, Wedge.Color.A);
+			}
+			for (int32 i = 0; i < MeshFaces.Num(); i++)
+			{
+				const SkeletalMeshImportData::FMeshFace& Face = MeshFaces[i];
+				UE_LOG(LogTemp, Log, TEXT("[Face %d] iWedge=(%d, %d, %d), MatIndex=%d, SmoothingGroups=%u"),
+					i,
+					Face.iWedge[0], Face.iWedge[1], Face.iWedge[2],
+					Face.MeshMaterialIndex,
+					Face.SmoothingGroups);
+			}
+			for (int32 i = 0; i < Points.Num(); i++)
+			{
+				const FVector3f& Point = Points[i];
+				UE_LOG(LogTemp, Log, TEXT("[Point %d] Position=(%f, %f, %f)"),
+					i,
+					Point.X, Point.Y, Point.Z);
+			}
+			for (int32 i = 0; i < PointsToOriginalMap.Num(); i++)
+			{
+				UE_LOG(LogTemp, Log, TEXT("[PointMap %d] OriginalIndex=%d"),
+					i,
+					PointsToOriginalMap[i]);
+			}
+			/////
+
+			/*MeshUtilities.BuildSkeletalMesh(
+				*NewLODModel,
+				SkeletalMesh->GetName(),
+				ReferenceSkeleton,
+				VertexInfluences,
+				MeshWedges,
+				MeshFaces,
+				Points,
+				PointsToOriginalMap,
+				BuildOptions
+			);*/
+
+			/*SkeletalMesh->AddLODInfo();
+			FSkeletalMeshLODInfo& LODInfo = *SkeletalMesh->GetLODInfo(0);
+			LODInfo.ScreenSize.Default = 1.0f;*/
+
+			break; // TODO: Remove once I can handle multiple LODs, This will only get TriShape of the LOD, not the full LOD
 		}
 	}
 }
@@ -210,7 +406,7 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 
 	// Parse NIF for mesh data
 	UNifSkeletalMeshFactory::FNifReferenceSkeleton NifReferenceSkeleton = ParseNif(Filename);
-	Test(Filename);
+	//Test(Filename);
 
 	// Create packages/assets
 	const FString BasePath = InParent->GetOutermost()->GetName();
@@ -223,6 +419,10 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 	// Build reference skeleton
 	FReferenceSkeleton ReferenceSkeleton = BuildReferenceSkeleton(NifReferenceSkeleton.BoneNames, NifReferenceSkeleton.ParentIndices, NifReferenceSkeleton.RefPose);
 	SkeletalMesh->SetRefSkeleton(ReferenceSkeleton);
+
+	/////
+	Test(Filename, SkeletalMesh);
+	/////
 
 	// Build skeleton
 	UPackage* SkelPkg = MakeAssetPackage(BasePath, InName.ToString() + TEXT("_Skeleton"), SkelObjName);
