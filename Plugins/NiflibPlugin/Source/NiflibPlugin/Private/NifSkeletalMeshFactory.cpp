@@ -156,7 +156,7 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const NiGeometryDa
 		const uint32 VertexIndices[3] = { Triangle.v1, Triangle.v2, Triangle.v3 };
 
 		MeshFace.MeshMaterialIndex = 0;
-		MeshFace.SmoothingGroups = 0;
+		MeshFace.SmoothingGroups = 1;
 
 		for (int i = 0; i < std::size(VertexIndices); i++)
 		{
@@ -177,6 +177,27 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const NiGeometryDa
 	MaterialProperty->get*/
 
 	return MeshFaces;
+}
+
+static TArray<SkeletalMeshImportData::FMeshFace> BuildFacesFromWedges(const TArray<SkeletalMeshImportData::FMeshWedge>& Wedges)
+{
+	TArray<SkeletalMeshImportData::FMeshFace> Faces;
+	Faces.Reserve(Wedges.Num() / 3);
+
+	for (int32 Base = 0; Base + 2 < Wedges.Num(); Base += 3)
+	{
+		SkeletalMeshImportData::FMeshFace Face{};
+		Face.MeshMaterialIndex = 0;
+		Face.SmoothingGroups = 1;
+
+		Face.iWedge[0] = static_cast<uint32>(Base + 0);
+		Face.iWedge[1] = static_cast<uint32>(Base + 1);
+		Face.iWedge[2] = static_cast<uint32>(Base + 2);
+
+		// Leave tangents zero; let the builder recompute if needed
+		Faces.Add(Face);
+	}
+	return Faces;
 }
 
 static TArray<FVector3f> GetPoints(const NiGeometryDataRef& GeometryData)
@@ -203,33 +224,6 @@ static TArray<int32> GetPointsToOriginalMap(const NiGeometryDataRef& GeometryDat
 	}
 
 	return PointsToOriginalMap;
-}
-
-static void BuildLOD(
-	const FString& MeshName,
-	const FReferenceSkeleton& RefSkeleton,
-	const TArray<SkeletalMeshImportData::FVertInfluence>& Influences,
-	const TArray<SkeletalMeshImportData::FMeshWedge>& Wedges,
-	const TArray<SkeletalMeshImportData::FMeshFace>& Faces,
-	const TArray<FVector3f>& Points,
-	const TArray<int32>& PointsToOriginalMap,
-	const IMeshUtilities::MeshBuildOptions& BuildOptions
-)
-{
-	FSkeletalMeshLODModel LODModel;
-	IMeshUtilities& MeshUtilities = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
-
-	MeshUtilities.BuildSkeletalMesh(
-		LODModel,
-		MeshName,
-		RefSkeleton,
-		Influences,
-		Wedges,
-		Faces,
-		Points,
-		PointsToOriginalMap,
-		BuildOptions
-	);
 }
 
 struct FNifReferenceSkeleton
@@ -287,12 +281,12 @@ static FReferenceSkeleton BuildReferenceSkeleton(
 
 static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 {
-	/*FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
+	FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
 	ImportedModel->LODModels.Add(new FSkeletalMeshLODModel());
-	FSkeletalMeshLODModel* NewLODModel = &ImportedModel->LODModels[0];*/
+	FSkeletalMeshLODModel* NewLODModel = &ImportedModel->LODModels[0];
 
 	std::vector<NiObjectRef> NifList = ReadNifList(TCHAR_TO_UTF8(*Filename));
-	//IMeshUtilities& MeshUtilities = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
+	IMeshUtilities& MeshUtilities = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
 	NiMultiTargetTransformControllerRef MultiTargetTransformController;
 	FNifReferenceSkeleton NifSkeleton;
 
@@ -322,55 +316,203 @@ static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 			const FReferenceSkeleton& ReferenceSkeleton = BuildReferenceSkeleton(NifSkeleton.BoneNames, NifSkeleton.ParentIndices, NifSkeleton.RefPose);
 			const TArray<SkeletalMeshImportData::FVertInfluence>& VertexInfluences = GetVertexInfluences(TriShape->GetSkinInstance(), MultiTargetTransformController);
 			const TArray<SkeletalMeshImportData::FMeshWedge>& MeshWedges = GetMeshWedges(TriShape->GetData());
-			const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = GetMeshFaces(TriShape->GetData());
+			const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = BuildFacesFromWedges(MeshWedges);//GetMeshFaces(TriShape->GetData());
 			const TArray<FVector3f>& Points = GetPoints(TriShape->GetData());
 			const TArray<int32>& PointsToOriginalMap = GetPointsToOriginalMap(TriShape->GetData());
 			IMeshUtilities::MeshBuildOptions BuildOptions;
+			BuildOptions.bComputeNormals = true;
+			BuildOptions.bComputeTangents = true;
+			BuildOptions.bUseMikkTSpace = true;
 
 			/////
+			int32 NumInfluenceErrors = 0;
+			int32 NumWedgeErrors = 0;
+			int32 NumFaceErrors = 0;
+			int32 NumPointErrors = 0;
+			int32 NumPointMapErrors = 0;
+
+			const int64 PointsCount64 = static_cast<int64>(Points.Num());
+
+			// --- Preflight summary & invariants ---
+			UE_LOG(LogTemp, Log, TEXT("Preflight: Faces=%d Wedges=%d Points=%d RawPointMap=%d Influences=%d"),
+				MeshFaces.Num(), MeshWedges.Num(), Points.Num(), PointsToOriginalMap.Num(), VertexInfluences.Num());
+
+			if (MeshFaces.Num() * 3 != MeshWedges.Num())
+			{
+				UE_LOG(LogTemp, Error, TEXT("Invariant failed: Faces*3 != Wedges (%d*3 != %d)"),
+					MeshFaces.Num(), MeshWedges.Num());
+			}
+
+			if (PointsToOriginalMap.Num() != Points.Num())
+			{
+				UE_LOG(LogTemp, Warning, TEXT("PointToOriginalMap size mismatch: %d vs Points %d"),
+					PointsToOriginalMap.Num(), Points.Num());
+			}
+
+			// Degenerate geometry checks
+			int32 DegenerateFaceCount = 0;
+			for (int32 fi = 0; fi < MeshFaces.Num(); ++fi)
+			{
+				const auto& F = MeshFaces[fi];
+				const int32 i0 = (int32)F.iWedge[0];
+				const int32 i1 = (int32)F.iWedge[1];
+				const int32 i2 = (int32)F.iWedge[2];
+
+				// duplicate wedge indices?
+				if (i0 == i1 || i1 == i2 || i0 == i2)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("Face %d has duplicate wedge indices (%d,%d,%d)"), fi, i0, i1, i2);
+					++DegenerateFaceCount;
+					continue;
+				}
+
+				// zero-area triangle?
+				const int32 v0 = (int32)MeshWedges[i0].iVertex;
+				const int32 v1 = (int32)MeshWedges[i1].iVertex;
+				const int32 v2 = (int32)MeshWedges[i2].iVertex;
+				if (v0 < 0 || v1 < 0 || v2 < 0 || v0 >= Points.Num() || v1 >= Points.Num() || v2 >= Points.Num())
+				{
+					UE_LOG(LogTemp, Error, TEXT("Face %d references out-of-range vertex indices (%d,%d,%d)"), fi, v0, v1, v2);
+					++DegenerateFaceCount;
+					continue;
+				}
+
+				const FVector3f& P0 = Points[v0];
+				const FVector3f& P1 = Points[v1];
+				const FVector3f& P2 = Points[v2];
+				const FVector3f E0 = P1 - P0;
+				const FVector3f E1 = P2 - P0;
+				const float Area2 = FVector3f::CrossProduct(E0, E1).SizeSquared();
+
+				if (!FMath::IsFinite(Area2) || Area2 <= KINDA_SMALL_NUMBER)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("Face %d is degenerate (area ~ 0)"), fi);
+					++DegenerateFaceCount;
+				}
+			}
+			UE_LOG(LogTemp, Log, TEXT("Preflight: DegenerateFaces=%d"), DegenerateFaceCount);
+
+			// Influence coverage summary
+			TArray<float> WeightSums;
+			WeightSums.Init(0.f, Points.Num());
+			for (const auto& Inf : VertexInfluences)
+			{
+				const int32 vi = (int32)Inf.VertIndex;
+				if (vi >= 0 && vi < WeightSums.Num() && FMath::IsFinite(Inf.Weight))
+				{
+					WeightSums[vi] += Inf.Weight;
+				}
+			}
+
+			int32 ZeroInfluenceVerts = 0, BadSumVerts = 0;
+			for (int32 vi = 0; vi < WeightSums.Num(); ++vi)
+			{
+				const float s = WeightSums[vi];
+				if (s <= SMALL_NUMBER) { ++ZeroInfluenceVerts; }
+				else if (!FMath::IsFinite(s) || s < 0.f || s > 1.f + 0.05f) { ++BadSumVerts; }
+			}
+			UE_LOG(LogTemp, Log, TEXT("Influence coverage: ZeroInfluenceVerts=%d  BadSumVerts=%d"),
+				ZeroInfluenceVerts, BadSumVerts);
+
+
+			// ---- Influences ----
 			for (int32 i = 0; i < VertexInfluences.Num(); i++)
 			{
-				const SkeletalMeshImportData::FVertInfluence& Influence = VertexInfluences[i];
-				UE_LOG(LogTemp, Log, TEXT("[Influence %d] VertexIndex=%d, BoneIndex=%d, Weight=%f"),
-					i,
-					Influence.VertIndex,
-					Influence.BoneIndex,
-					Influence.Weight);
+				const auto& Influence = VertexInfluences[i];
+
+				const int64 vIdx64 = static_cast<int64>(Influence.VertIndex);
+				const bool bBadVert =
+					(vIdx64 < 0) || (vIdx64 >= PointsCount64) || !FMath::IsFinite(Influence.Weight) ||
+					(Influence.Weight < 0.0f) || (Influence.Weight > 1.0f);
+
+				if (bBadVert)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[Influence %d] Invalid: VertIndex=%lld (Points=%lld), BoneIndex=%d, Weight=%f"),
+						i, vIdx64, PointsCount64, (int32)Influence.BoneIndex, Influence.Weight);
+				}
+
+				UE_LOG(LogTemp, Log, TEXT("[Influence %d] VertexIndex=%lld, BoneIndex=%d, Weight=%f"),
+					i, vIdx64, (int32)Influence.BoneIndex, Influence.Weight);
 			}
+
+			// ---- Wedges ----
 			for (int32 i = 0; i < MeshWedges.Num(); i++)
 			{
-				const SkeletalMeshImportData::FMeshWedge& Wedge = MeshWedges[i];
-				UE_LOG(LogTemp, Log, TEXT("[Wedge %d] iVertex=%d, UV=(%f, %f), Color=(R=%d,G=%d,B=%d,A=%d)"),
-					i,
-					Wedge.iVertex,
-					Wedge.UVs[0].X, Wedge.UVs[0].Y,
+				const auto& Wedge = MeshWedges[i];
+
+				const int64 iVert64 = static_cast<int64>(Wedge.iVertex);
+				const bool bBad =
+					(iVert64 < 0) || (iVert64 >= PointsCount64) ||
+					!FMath::IsFinite(Wedge.UVs[0].X) || !FMath::IsFinite(Wedge.UVs[0].Y);
+
+				if (bBad)
+				{
+					UE_LOG(LogTemp, Error,
+						TEXT("[Wedge %d] Invalid: iVertex=%lld (Points=%lld), UV=(%f,%f)"),
+						i, iVert64, PointsCount64, Wedge.UVs[0].X, Wedge.UVs[0].Y);
+				}
+
+				UE_LOG(LogTemp, Log,
+					TEXT("[Wedge %d] iVertex=%lld, UV=(%f,%f), Color=(R=%d,G=%d,B=%d,A=%d)"),
+					i, iVert64, Wedge.UVs[0].X, Wedge.UVs[0].Y,
 					Wedge.Color.R, Wedge.Color.G, Wedge.Color.B, Wedge.Color.A);
 			}
+
+			// ---- Faces ----
+			const int64 NumWedges64 = static_cast<int64>(MeshWedges.Num());
+
 			for (int32 i = 0; i < MeshFaces.Num(); i++)
 			{
-				const SkeletalMeshImportData::FMeshFace& Face = MeshFaces[i];
-				UE_LOG(LogTemp, Log, TEXT("[Face %d] iWedge=(%d, %d, %d), MatIndex=%d, SmoothingGroups=%u"),
-					i,
-					Face.iWedge[0], Face.iWedge[1], Face.iWedge[2],
-					Face.MeshMaterialIndex,
-					Face.SmoothingGroups);
+				const auto& Face = MeshFaces[i];
+
+				int64 w0 = static_cast<int64>(Face.iWedge[0]);
+				int64 w1 = static_cast<int64>(Face.iWedge[1]);
+				int64 w2 = static_cast<int64>(Face.iWedge[2]);
+
+				bool bBad = false;
+				if (w0 < 0 || w0 >= NumWedges64) { UE_LOG(LogTemp, Error, TEXT("[Face %d] iWedge[0]=%lld OOB (NumWedges=%lld)"), i, w0, NumWedges64); bBad = true; }
+				if (w1 < 0 || w1 >= NumWedges64) { UE_LOG(LogTemp, Error, TEXT("[Face %d] iWedge[1]=%lld OOB (NumWedges=%lld)"), i, w1, NumWedges64); bBad = true; }
+				if (w2 < 0 || w2 >= NumWedges64) { UE_LOG(LogTemp, Error, TEXT("[Face %d] iWedge[2]=%lld OOB (NumWedges=%lld)"), i, w2, NumWedges64); bBad = true; }
+
+				if (w0 == w1 || w1 == w2 || w0 == w2)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[Face %d] Degenerate: iWedge=(%lld,%lld,%lld)"), i, w0, w1, w2);
+				}
+
+				UE_LOG(LogTemp, Log, TEXT("[Face %d] iWedge=(%lld,%lld,%lld), MatIndex=%d, Smoothing=%u"),
+					i, w0, w1, w2, Face.MeshMaterialIndex, Face.SmoothingGroups);
 			}
+
+			// Points
 			for (int32 i = 0; i < Points.Num(); i++)
 			{
-				const FVector3f& Point = Points[i];
-				UE_LOG(LogTemp, Log, TEXT("[Point %d] Position=(%f, %f, %f)"),
-					i,
-					Point.X, Point.Y, Point.Z);
+				const auto& P = Points[i];
+				if (P.ContainsNaN() || !FMath::IsFinite(P.X) || !FMath::IsFinite(P.Y) || !FMath::IsFinite(P.Z))
+				{
+					UE_LOG(LogTemp, Error, TEXT("[Point %d] Invalid (NaN/Inf): (%f,%f,%f)"), i, P.X, P.Y, P.Z);
+				}
+				UE_LOG(LogTemp, Log, TEXT("[Point %d] (%f,%f,%f)"), i, P.X, P.Y, P.Z);
 			}
+
+			// Point map
 			for (int32 i = 0; i < PointsToOriginalMap.Num(); i++)
 			{
-				UE_LOG(LogTemp, Log, TEXT("[PointMap %d] OriginalIndex=%d"),
-					i,
-					PointsToOriginalMap[i]);
+				int64 orig64 = static_cast<int64>(PointsToOriginalMap[i]);
+				if (orig64 < 0 /* or compare to original source count if you track it */)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[PointMap %d] Invalid OriginalIndex=%lld"), i, orig64);
+				}
+				UE_LOG(LogTemp, Log, TEXT("[PointMap %d] OriginalIndex=%lld"), i, orig64);
 			}
+
+			// ---- Summary ----
+			UE_LOG(LogTemp, Warning, TEXT("Summary of validation: Influences=%d errors, Wedges=%d errors, Faces=%d errors, Points=%d errors, PointMap=%d errors"),
+				NumInfluenceErrors, NumWedgeErrors, NumFaceErrors, NumPointErrors, NumPointMapErrors);
+
 			/////
 
-			/*MeshUtilities.BuildSkeletalMesh(
+			MeshUtilities.BuildSkeletalMesh(
 				*NewLODModel,
 				SkeletalMesh->GetName(),
 				ReferenceSkeleton,
@@ -380,11 +522,14 @@ static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 				Points,
 				PointsToOriginalMap,
 				BuildOptions
-			);*/
+			);
 
-			/*SkeletalMesh->AddLODInfo();
-			FSkeletalMeshLODInfo& LODInfo = *SkeletalMesh->GetLODInfo(0);
-			LODInfo.ScreenSize.Default = 1.0f;*/
+			SkeletalMesh->AddLODInfo();
+			FSkeletalMeshLODInfo* LODInfo = SkeletalMesh->GetLODInfo(0);
+			LODInfo->BuildSettings.bRecomputeNormals = true;
+			LODInfo->BuildSettings.bRecomputeTangents = true;
+			LODInfo->BuildSettings.bUseMikkTSpace = true;
+			//LODInfo.ScreenSize.Default = 1.0f;
 
 			break; // TODO: Remove once I can handle multiple LODs, This will only get TriShape of the LOD, not the full LOD
 		}
