@@ -531,6 +531,29 @@ static void Test(const FString& Filename, USkeletalMesh* SkeletalMesh)
 			LODInfo->BuildSettings.bUseMikkTSpace = true;
 			//LODInfo.ScreenSize.Default = 1.0f;
 
+			/////
+			// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)
+			NewLODModel->NumTexCoords = FMath::Max<uint32>(NewLODModel->NumTexCoords, 1u);
+
+			// Materials slots (minimum)
+			int32 MaxSectionMatIndex = -1;
+			for (const FSkelMeshSection& Sec : NewLODModel->Sections)
+				MaxSectionMatIndex = FMath::Max(MaxSectionMatIndex, (int32)Sec.MaterialIndex);
+
+			if (MaxSectionMatIndex >= 0)
+				while (SkeletalMesh->GetMaterials().Num() <= MaxSectionMatIndex)
+					SkeletalMesh->GetMaterials().Add(FSkeletalMaterial());
+
+			// Bounds (from this LOD’s points)
+			{
+				FBox BoundsBox(ForceInit);
+				for (const FVector3f& P : Points)
+					BoundsBox += (FVector)P;
+				if (BoundsBox.IsValid)
+					SkeletalMesh->SetImportedBounds(FBoxSphereBounds(BoundsBox));
+			}
+			/////
+
 			break; // TODO: Remove once I can handle multiple LODs, This will only get TriShape of the LOD, not the full LOD
 		}
 	}
