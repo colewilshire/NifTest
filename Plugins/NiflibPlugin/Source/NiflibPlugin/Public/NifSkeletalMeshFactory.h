@@ -34,23 +34,5 @@ public:
 	) override;
 
 private:
-	struct FNifReferenceSkeleton
-	{
-		TArray<FName> BoneNames;
-		TArray<int32> ParentIndices;
-		TArray<FTransform> RefPose;
-	};
-	struct FNifLODGeometry
-	{
-		TArray<FVector3f> Positions;
-		TArray<uint32> Indices;
-		TArray<FVector3f> Normals;
-		TArray<FVector4f> Tangents;
-		TArray<FVector2f> UVs;
-		TArray<FColor> VertexColors;
-	};
 
-	FNifLODGeometry ParseNifLODGeometry(const vector<NiTriShapeRef>& LODTriShapes);
-	std::vector<NiTriShapeRef> GetDescendantTriShapes(const NiNodeRef& LOD, std::vector<NiTriShapeRef>& FoundTriShapes);
-	NiNodeRef FindFirstAncestorThatIsALOD(const NiNodeRef& Node);
 };
