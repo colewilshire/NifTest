@@ -415,6 +415,9 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 			LODInfo->BuildSettings.bRecomputeTangents = true;
 			LODInfo->BuildSettings.bUseMikkTSpace = true;
 
+			// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)	// TODO: We are manually setting UVs to 0 because none exist before this point
+			NewLODModel->NumTexCoords = FMath::Max<uint32>(NewLODModel->NumTexCoords, 1u);
+
 			//// Materials slots (minimum)	// TODO: Materials
 			int32 MaxSectionMatIndex = -1;
 			for (const FSkelMeshSection& Sec : NewLODModel->Sections)
