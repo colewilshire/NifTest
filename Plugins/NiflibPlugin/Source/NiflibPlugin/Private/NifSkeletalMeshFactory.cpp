@@ -87,6 +87,7 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const NiGeometry
 	return MeshWedges;
 }
 
+// TODO: Delete
 static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const NiGeometryDataRef& GeometryData)
 {
 	const NiTriShapeDataRef& TriShapeData = DynamicCast<NiTriShapeData>(GeometryData);
@@ -118,9 +119,6 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const NiGeometryDa
 
 		MeshFaces.Add(MeshFace);
 	}
-	/*const NiPropertyRef& Property = TriShape->GetPropertyByType(NiMaterialProperty::TYPE);
-	const NiMaterialPropertyRef& MaterialProperty = DynamicCast<NiMaterialProperty>(Property);
-	MaterialProperty->get*/	//TODO: Materials
 
 	return MeshFaces;
 }
@@ -143,8 +141,15 @@ static TArray<SkeletalMeshImportData::FMeshFace> BuildFacesFromWedges(const TArr
 		// Leave tangents zero; let the builder recompute if needed
 		Faces.Add(Face);
 	}
+
 	return Faces;
 }
+
+// Skeleton shared between all LODs
+// Some LODs made up of more than one TriShape
+// Wedges, Faces, Points, and PointsMap from different TriShapes need to be merged into a common list, I think
+// The above could be accomplished by taking double depth vectors, instead of single depth vectors, then just iterating over the entire function
+// The Faces from different TriShapes need different MeshMaterialIndexes
 
 static TArray<FVector3f> GetPoints(const NiGeometryDataRef& GeometryData)
 {
@@ -152,6 +157,7 @@ static TArray<FVector3f> GetPoints(const NiGeometryDataRef& GeometryData)
 
 	for (const Vector3& Vertex : GeometryData->GetVertices())
 	{
+		//FVector3f Point = { Vertex.y, -Vertex.x, Vertex.z };
 		FVector3f Point = { Vertex.x, Vertex.y, Vertex.z };
 		Points.Add(Point);
 	}
@@ -161,8 +167,8 @@ static TArray<FVector3f> GetPoints(const NiGeometryDataRef& GeometryData)
 
 static TArray<int32> GetPointsToOriginalMap(const NiGeometryDataRef& GeometryData)
 {
-	TArray<int32> PointsToOriginalMap;
 	const std::vector<Vector3>& Vertices = GeometryData->GetVertices();
+	TArray<int32> PointsToOriginalMap;
 
 	for (int i = 0; i < Vertices.size(); i++)
 	{
@@ -172,12 +178,30 @@ static TArray<int32> GetPointsToOriginalMap(const NiGeometryDataRef& GeometryDat
 	return PointsToOriginalMap;
 }
 
+//static NiMaterialPropertyRef GetMaterial(const NiTriShapeRef& TriShape)
+//{
+//	TriShape->Getbis
+//	const NiPropertyRef& Property = TriShape->GetPropertyByType(NiMaterialProperty::TYPE);
+//	const NiMaterialPropertyRef& MaterialProperty = DynamicCast<NiMaterialProperty>(Property);
+//	//MaterialProperty->get*/	//TODO: Materials
+//	MaterialProperty->get
+//
+//	return MaterialProperty;
+//}
+
 struct FNifReferenceSkeleton
 {
 	TArray<FName> BoneNames;
 	TArray<int32> ParentIndices;
 	TArray<FTransform> RefPose;
 };
+
+//static FORCEINLINE FQuat NifQuatToUE(const Quaternion& q)
+//{
+//	const FQuat Qn(q.x, q.y, q.z, q.w);                 // NIF -> UE order (x,y,z,w)
+//	const FQuat Basis = FQuat(FVector::UpVector, FMath::DegreesToRadians(-90.f)); // -90° about Z
+//	return Basis * Qn * Basis.Inverse();                 // rotate into UE basis
+//}
 
 // TODO: Skeleton seems inverted. For example, the bone leg_R is on the left side
 static FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& Bone, const int32 ParentIndex = -1, FNifReferenceSkeleton Skeleton = {})
@@ -188,6 +212,8 @@ static FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& Bone, const int32
 
 	FTransform Transform;
 	Transform.SetLocation(FVector(Location.x, Location.y, Location.z));
+	//Transform.SetLocation(FVector(Location.y, -Location.x, Location.z));
+	//Transform.SetRotation(NifQuatToUE(Rotation));
 	Transform.SetRotation(FQuat(Rotation.x, Rotation.y, Rotation.z, Rotation.w));
 	Transform.SetScale3D(FVector(Scale));
 
@@ -227,6 +253,29 @@ static FReferenceSkeleton BuildReferenceSkeleton(
 	return RefSkeleton;
 }
 
+static std::vector<NiTriShapeRef> GetDescendantTriShapes(const NiNodeRef& Parent, std::vector<NiTriShapeRef> FoundTriShapes = {})
+{
+	for (const NiAVObjectRef& Child : Parent->GetChildren())
+	{
+		const NiTriShapeRef& TriShape = DynamicCast<NiTriShape>(Child);
+		if (TriShape)
+		{
+			FoundTriShapes.push_back(TriShape);
+		}
+		else
+		{
+			const NiNodeRef& Node = DynamicCast<NiNode>(Child);
+			if (Node)
+
+			{
+				FoundTriShapes = GetDescendantTriShapes(Node, FoundTriShapes);
+			}
+		}
+	}
+
+	return FoundTriShapes;
+}
+
 static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 {
 	FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
@@ -256,6 +305,76 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 		}
 	}
 
+	//NiLODNodeRef LODNode;
+	//std::vector<std::vector<NiTriShapeRef>> LODs;
+
+	//for (const NiObjectRef& Object : NifList)
+	//{
+	//	LODNode = DynamicCast<NiLODNode>(Object);
+	//	if (LODNode)
+	//	{
+	//		// All children of LODNode should be valid LODs (NiRangeLODData is a property, not a child)
+	//		for (const NiAVObjectRef& Child : LODNode->GetChildren())
+	//		{
+	//			const NiNodeRef& LOD = DynamicCast<NiNode>(Child);
+	//			if (LOD)
+	//			{
+	//				LODs.push_back(GetDescendantTriShapes(LOD));
+	//			}
+	//		}
+	//		break;
+	//	}
+	//}
+	//for (int i = 0; i < LODs.size(); i++)
+	//{
+	//	for (NiTriShapeRef TriShape : LODs[i])
+	//	{
+	//		const FReferenceSkeleton& ReferenceSkeleton = BuildReferenceSkeleton(NifSkeleton.BoneNames, NifSkeleton.ParentIndices, NifSkeleton.RefPose);
+	//		SkeletalMesh->SetRefSkeleton(ReferenceSkeleton);
+
+	//		const TArray<SkeletalMeshImportData::FVertInfluence>& VertexInfluences = GetVertexInfluences(TriShape->GetSkinInstance(), MultiTargetTransformController);
+	//		const TArray<SkeletalMeshImportData::FMeshWedge>& MeshWedges = GetMeshWedges(TriShape->GetData());
+	//		const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = BuildFacesFromWedges(MeshWedges);
+	//		const TArray<FVector3f>& Points = GetPoints(TriShape->GetData());
+	//		const TArray<int32>& PointsToOriginalMap = GetPointsToOriginalMap(TriShape->GetData());
+	//		IMeshUtilities::MeshBuildOptions BuildOptions;
+
+	//		// TODO: Get tangents from NIF
+	//		BuildOptions.bComputeNormals = true;
+	//		BuildOptions.bComputeTangents = true;
+	//		BuildOptions.bUseMikkTSpace = true;
+
+	//		MeshUtilities.BuildSkeletalMesh(
+	//			*NewLODModel,
+	//			SkeletalMesh->GetName(),
+	//			ReferenceSkeleton,
+	//			VertexInfluences,
+	//			MeshWedges,
+	//			MeshFaces,
+	//			Points,
+	//			PointsToOriginalMap,
+	//			BuildOptions
+	//		);
+
+	//		/////
+	//		SkeletalMesh->AddLODInfo();
+	//		FSkeletalMeshLODInfo* LODInfo = SkeletalMesh->GetLODInfo(i);
+	//		// TODO: Get tangents from NIF
+	//		LODInfo->BuildSettings.bRecomputeNormals = true;
+	//		LODInfo->BuildSettings.bRecomputeTangents = true;
+	//		LODInfo->BuildSettings.bUseMikkTSpace = true;
+
+	//		//// Materials slots (minimum)	// TODO: Materials
+	//		int32 MaxSectionMatIndex = -1;
+	//		for (const FSkelMeshSection& Sec : NewLODModel->Sections)
+	//			MaxSectionMatIndex = FMath::Max(MaxSectionMatIndex, (int32)Sec.MaterialIndex);
+
+	//		if (MaxSectionMatIndex >= 0)
+	//			while (SkeletalMesh->GetMaterials().Num() <= MaxSectionMatIndex)
+	//				SkeletalMesh->GetMaterials().Add(FSkeletalMaterial());
+	//	}
+	//}
+
 	for (const NiObjectRef& Object : NifList)
 	{
 		const NiTriShapeRef TriShape = DynamicCast<NiTriShape>(Object);
@@ -271,7 +390,7 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 			const TArray<int32>& PointsToOriginalMap = GetPointsToOriginalMap(TriShape->GetData());
 			IMeshUtilities::MeshBuildOptions BuildOptions;
 
-			// TODO: Calculate my own UVs
+			// TODO: Get tangents from NIF
 			BuildOptions.bComputeNormals = true;
 			BuildOptions.bComputeTangents = true;
 			BuildOptions.bUseMikkTSpace = true;
@@ -291,13 +410,10 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 			/////
 			SkeletalMesh->AddLODInfo();
 			FSkeletalMeshLODInfo* LODInfo = SkeletalMesh->GetLODInfo(0);
-			// TODO: Calculate my own UVs
+			// TODO: Get tangents from NIF
 			LODInfo->BuildSettings.bRecomputeNormals = true;
 			LODInfo->BuildSettings.bRecomputeTangents = true;
 			LODInfo->BuildSettings.bUseMikkTSpace = true;
-
-			//// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)	// TODO: UVs
-			NewLODModel->NumTexCoords = FMath::Max<uint32>(NewLODModel->NumTexCoords, 1u);
 
 			//// Materials slots (minimum)	// TODO: Materials
 			int32 MaxSectionMatIndex = -1;
@@ -307,16 +423,6 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 			if (MaxSectionMatIndex >= 0)
 				while (SkeletalMesh->GetMaterials().Num() <= MaxSectionMatIndex)
 					SkeletalMesh->GetMaterials().Add(FSkeletalMaterial());
-
-			//// Bounds (from this LOD’s points)
-			{
-				FBox BoundsBox(ForceInit);
-				for (const FVector3f& P : Points)
-					BoundsBox += (FVector)P;
-				if (BoundsBox.IsValid)
-					SkeletalMesh->SetImportedBounds(FBoxSphereBounds(BoundsBox));
-			}
-			///////
 
 			break; // TODO: Remove once I can handle multiple LODs, This will only get one TriShape of the LOD, not the entirety of the TriShapes in the LOD
 		}
@@ -388,7 +494,6 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 	FAssetRegistryModule::AssetCreated(SkeletalMesh);
 	SkelPkg->MarkPackageDirty();
 	MeshPkg->MarkPackageDirty();
-
 	SkeletalMesh->PostEditChange();
 	Skeleton->PostEditChange();
 
