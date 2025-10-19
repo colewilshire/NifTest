@@ -24,25 +24,6 @@
 
 using namespace Niflib;
 
-static TArray<SkeletalMeshImportData::FRawBoneInfluence> GetRawBoneInfluences(const NiSkinInstanceRef& SkinInstance)
-{
-	const std::vector<NiNodeRef>& Bones = SkinInstance->GetBones();
-	const NiSkinDataRef& SkinData = SkinInstance->GetSkinData();
-	TArray<SkeletalMeshImportData::FRawBoneInfluence> RawBoneInfluences;
-
-	for (int BoneIndex = 0; BoneIndex < Bones.size(); BoneIndex++)	// Bone indices will be off by 2 from the reference skeleton, since its only counting children of the skin. Adjust.
-	{
-		const std::vector<SkinWeight>& SkinWeights = SkinData->GetBoneWeights(BoneIndex);
-		for (SkinWeight SkinWeight : SkinWeights)
-		{
-			SkeletalMeshImportData::FRawBoneInfluence RawBoneInfluence{ SkinWeight.index, BoneIndex, SkinWeight.weight };
-			RawBoneInfluences.Add(RawBoneInfluence);
-		}
-	}
-
-	return RawBoneInfluences;
-}
-
 static TArray<SkeletalMeshImportData::FVertInfluence> GetVertexInfluences(const NiSkinInstanceRef& SkinInstance, const NiMultiTargetTransformControllerRef& MultiTargetTransformController)
 {
 	const std::vector<NiNodeRef>& Bones = SkinInstance->GetBones();
@@ -351,21 +332,6 @@ static UPackage* MakeAssetPackage(const FString& BasePath, const FString& AssetN
 	return CreatePackage(*PackageName);
 }
 
-// Given tangent, bitangent, and normal from NIF data, produce an Unreal-compatible tangent
-static FVector4f MakeUnrealTangent(const FVector3f& Tangent, const FVector3f& Bitangent, const FVector3f& Normal)
-{
-	// Ensure all are normalized
-	FVector3f T = Tangent.GetSafeNormal();
-	FVector3f B = Bitangent.GetSafeNormal();
-	FVector3f N = Normal.GetSafeNormal();
-
-	// Calculate handedness: +1 if B matches cross(N,T), -1 if opposite
-	float Handedness = (FVector3f::DotProduct(FVector3f::CrossProduct(N, T), B) < 0.0f) ? -1.0f : 1.0f;
-
-	// Unreal packs XYZ in Tangent, and W as sign of bitangent
-	return FVector4f(T.X, T.Y, T.Z, Handedness);
-}
-
 UNifSkeletalMeshFactory::UNifSkeletalMeshFactory()
 {
 	SupportedClass = USkeletalMesh::StaticClass();
@@ -426,8 +392,9 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 	SkeletalMesh->PostEditChange();
 	Skeleton->PostEditChange();
 
-	// Force reload to auto-generate missing MeshDescription
-	// SkeletalMesh->PostLoad();
+	// Force asset reload to auto-generate missing MeshDescription (I think)
+	UE_LOG(LogTemp, Log, TEXT("[NIF] Imported SkeletalMesh %s  (LODs: %d)"), *MeshObjName, SkeletalMesh->GetImportedModel()->LODModels.Num());	// Prevents crash from calling PostLoad, for some reason.
+	SkeletalMesh->PostLoad();	// Prevents crash from trying to edit bone weights without saving asset and reloading editor first.
 
 	return SkeletalMesh;
 }
