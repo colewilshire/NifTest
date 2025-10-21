@@ -71,6 +71,7 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const std::vecto
 
 			for (int i = 0; i < std::size(MeshWedge); i++)
 			{
+				// TODO: Index UVs based on NIF vertex indices, not the offset Unreal ones
 				/*for (int j = 0; j < TriShapeData->GetUVSetCount(); j++)
 				{
 					const std::vector<TexCoord>& UVSet = TriShapeData->GetUVSet(j);
@@ -78,7 +79,7 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const std::vecto
 					MeshWedge[i].UVs[j] = UV;
 				}*/
 
-				/*if (!Colors.empty())
+				if (!Colors.empty())
 				{
 					const FColor Color(
 						(uint8)(Colors[MeshWedge[i].iVertex].r * 255.0f),
@@ -87,7 +88,7 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const std::vecto
 						(uint8)(Colors[MeshWedge[i].iVertex].a * 255.0f)
 					);
 					MeshWedge[i].Color = Color;
-				}*/
+				}
 
 				MeshWedges.Add(MeshWedge[i]);
 			}
@@ -217,7 +218,14 @@ static std::vector<NiTriShapeRef> GetDescendantTriShapes(const NiNodeRef& Parent
 		const NiTriShapeRef& TriShape = DynamicCast<NiTriShape>(Child);
 		if (TriShape)
 		{
-			FoundTriShapes.push_back(TriShape);
+			// TODO: Find a better way to determine if a TriShape should be thrown out
+			FString TriShapeName = UTF8_TO_TCHAR(TriShape->GetName().c_str());
+			TriShapeName = TriShapeName.ToLower();
+
+			if (!TriShapeName.Contains(TEXT("shadow")))
+			{
+				FoundTriShapes.push_back(TriShape);
+			}
 		}
 		else
 		{
