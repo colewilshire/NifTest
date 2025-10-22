@@ -71,13 +71,12 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const std::vecto
 
 			for (int i = 0; i < std::size(MeshWedge); i++)
 			{
-				// TODO: Index UVs based on NIF vertex indices, not the offset Unreal ones
-				/*for (int j = 0; j < TriShapeData->GetUVSetCount(); j++)
+				for (int j = 0; j < TriShapeData->GetUVSetCount(); j++)
 				{
 					const std::vector<TexCoord>& UVSet = TriShapeData->GetUVSet(j);
-					const FVector2f UV = { UVSet[MeshWedge[i].iVertex].u, UVSet[MeshWedge[i].iVertex].v };
+					const FVector2f UV = { UVSet[MeshWedge[i].iVertex - Offset].u, UVSet[MeshWedge[i].iVertex - Offset].v };
 					MeshWedge[i].UVs[j] = UV;
-				}*/
+				}
 
 				if (!Colors.empty())
 				{
@@ -103,8 +102,9 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const std::vecto
 static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<SkeletalMeshImportData::FMeshWedge>& Wedges, const std::vector<NiGeometryDataRef>& GeometryDataRefs)
 {
 	TArray<SkeletalMeshImportData::FMeshFace> Faces;
-	Faces.Reserve(Wedges.Num() / 3);
 	int32 Offset = 0;
+	Faces.Reserve(Wedges.Num() / 3);
+
 	for (int32 i = 0; i < GeometryDataRefs.size(); i++)
 	{
 		const NiTriShapeDataRef& TriShapeData = DynamicCast<NiTriShapeData>(GeometryDataRefs[i]);
@@ -130,30 +130,6 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<Skele
 
 	return Faces;
 }
-
-//static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<SkeletalMeshImportData::FMeshWedge>& Wedges)
-//{
-//	TArray<SkeletalMeshImportData::FMeshFace> Faces;
-//	Faces.Reserve(Wedges.Num() / 3);
-//
-//	for (int32 Base = 0; Base + 2 < Wedges.Num(); Base += 3)
-//	{
-//		SkeletalMeshImportData::FMeshFace Face{};
-//		Face.MeshMaterialIndex = 0;	// TODO: Find some way to indicate which pass we're on, and set the index accordingly
-//		Face.SmoothingGroups = 1;
-//
-//		Face.iWedge[0] = static_cast<uint32>(Base + 0);
-//		Face.iWedge[1] = static_cast<uint32>(Base + 1);
-//		Face.iWedge[2] = static_cast<uint32>(Base + 2);
-//
-//		UE_LOG(LogTemp, Log, TEXT("[NIF] Base[%d]: %d, %d, %d"), Base, Face.iWedge[0], Face.iWedge[1], Face.iWedge[2]);
-//
-//		// TODO: Tangents
-//		Faces.Add(Face);
-//	}
-//
-//	return Faces;
-//}
 
 static TArray<FVector3f> GetPoints(const std::vector<NiGeometryDataRef>& GeometryDataRefs)
 {
@@ -328,7 +304,6 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 		{
 			SkinInstances.push_back(TriShape->GetSkinInstance());
 			GeometryDataRefs.push_back(TriShape->GetData());
-			//break;	// TODO: Remove to access more than first TriShape of a LOD
 		}
 
 		const FReferenceSkeleton& ReferenceSkeleton = BuildReferenceSkeleton(NifSkeleton.BoneNames, NifSkeleton.ParentIndices, NifSkeleton.RefPose);
@@ -369,10 +344,10 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 		LODInfo->BuildSettings.bRecomputeTangents = true;
 		LODInfo->BuildSettings.bUseMikkTSpace = true;
 
-		// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)	// TODO: We are manually setting UVs to 1 because none exist before this point
+		// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)
 		OutLODModel->NumTexCoords = FMath::Max<uint32>(OutLODModel->NumTexCoords, 1u);
 
-		// Materials slots	// TODO: Materials
+		// Materials slots	// TODO: Get more data from materials than them merely existing
 		int32 MaxSectionMatIndex = -1;
 		for (const FSkelMeshSection& Sec : OutLODModel->Sections)
 			MaxSectionMatIndex = FMath::Max(MaxSectionMatIndex, (int32)Sec.MaterialIndex);
