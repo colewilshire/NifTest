@@ -81,10 +81,10 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const std::vecto
 				if (!Colors.empty())
 				{
 					const FColor Color(
-						(uint8)(Colors[MeshWedge[i].iVertex].r * 255.0f),
-						(uint8)(Colors[MeshWedge[i].iVertex].g * 255.0f),
-						(uint8)(Colors[MeshWedge[i].iVertex].b * 255.0f),
-						(uint8)(Colors[MeshWedge[i].iVertex].a * 255.0f)
+						(uint8)(Colors[MeshWedge[i].iVertex - Offset].r * 255.0f),
+						(uint8)(Colors[MeshWedge[i].iVertex - Offset].g * 255.0f),
+						(uint8)(Colors[MeshWedge[i].iVertex - Offset].b * 255.0f),
+						(uint8)(Colors[MeshWedge[i].iVertex - Offset].a * 255.0f)
 					);
 					MeshWedge[i].Color = Color;
 				}
@@ -109,6 +109,10 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<Skele
 	{
 		const NiTriShapeDataRef& TriShapeData = DynamicCast<NiTriShapeData>(GeometryDataRefs[i]);
 		const std::vector<Triangle>& Triangles = TriShapeData->GetTriangles();
+		const std::vector<Vector3>& Tangents = TriShapeData->GetTangents();
+		const std::vector<Vector3>& Bitangents = TriShapeData->GetBitangents();
+		const std::vector<Vector3>& Normals = TriShapeData->GetNormals();
+
 		for (int32 j = 0 + Offset; j < Triangles.size() + Offset; j++)
 		{
 			SkeletalMeshImportData::FMeshFace Face{};
@@ -119,9 +123,18 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<Skele
 			Face.iWedge[1] = j * 3 + 1;
 			Face.iWedge[2] = j * 3 + 2;
 
-			UE_LOG(LogTemp, Log, TEXT("[NIF] Face[%d]: %d, %d, %d"), j, Face.iWedge[0], Face.iWedge[1], Face.iWedge[2]);
+			Face.TangentX[0] = { Tangents[Triangles[j - Offset].v1].x, Tangents[Triangles[j - Offset].v1].y , Tangents[Triangles[j - Offset].v1].z };
+			Face.TangentX[1] = { Tangents[Triangles[j - Offset].v3].x, Tangents[Triangles[j - Offset].v3].y , Tangents[Triangles[j - Offset].v3].z };
+			Face.TangentX[2] = { Tangents[Triangles[j - Offset].v2].x, Tangents[Triangles[j - Offset].v2].y , Tangents[Triangles[j - Offset].v2].z };
 
-			// TODO: Tangents
+			Face.TangentY[0] = { Bitangents[Triangles[j - Offset].v1].x, Bitangents[Triangles[j - Offset].v1].y , Bitangents[Triangles[j - Offset].v1].z };
+			Face.TangentY[1] = { Bitangents[Triangles[j - Offset].v3].x, Bitangents[Triangles[j - Offset].v3].y , Bitangents[Triangles[j - Offset].v3].z };
+			Face.TangentY[2] = { Bitangents[Triangles[j - Offset].v2].x, Bitangents[Triangles[j - Offset].v2].y , Bitangents[Triangles[j - Offset].v2].z };
+
+			Face.TangentZ[0] = { Normals[Triangles[j - Offset].v1].x, Normals[Triangles[j - Offset].v1].y , Normals[Triangles[j - Offset].v1].z };
+			Face.TangentZ[1] = { Normals[Triangles[j - Offset].v3].x, Normals[Triangles[j - Offset].v3].y , Normals[Triangles[j - Offset].v3].z };
+			Face.TangentZ[2] = { Normals[Triangles[j - Offset].v2].x, Normals[Triangles[j - Offset].v2].y , Normals[Triangles[j - Offset].v2].z };
+
 			Faces.Add(Face);
 		}
 
@@ -172,6 +185,7 @@ struct FNifReferenceSkeleton
 	TArray<FTransform> RefPose;
 };
 
+// TODO: No handling exists yet for NIFs without a skeleton and/or NiMultiTargetTransformController
 // TODO: Skeleton seems inverted. For example, the bone leg_R is on the left side
 static FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& Bone, const int32 ParentIndex = -1, FNifReferenceSkeleton Skeleton = {})
 {
@@ -314,16 +328,15 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 		const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = GetMeshFaces(MeshWedges, GeometryDataRefs);
 		const TArray<FVector3f>& Points = GetPoints(GeometryDataRefs);
 		const TArray<int32>& PointsToOriginalMap = GetPointsToOriginalMap(GeometryDataRefs);
-		IMeshUtilities::MeshBuildOptions BuildOptions;
 
 		FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
 		ImportedModel->LODModels.Add(new FSkeletalMeshLODModel());
 		FSkeletalMeshLODModel* OutLODModel = &ImportedModel->LODModels[i];
 
-		// TODO: Get tangents from NIF
-		BuildOptions.bComputeNormals = true;
-		BuildOptions.bComputeTangents = true;
-		BuildOptions.bUseMikkTSpace = true;
+		IMeshUtilities::MeshBuildOptions BuildOptions;
+		BuildOptions.bComputeNormals = false;
+		BuildOptions.bComputeTangents = false;
+		BuildOptions.bUseMikkTSpace = false;
 
 		MeshUtilities.BuildSkeletalMesh(
 			*OutLODModel,
@@ -339,10 +352,9 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 
 		SkeletalMesh->AddLODInfo();
 		FSkeletalMeshLODInfo* LODInfo = SkeletalMesh->GetLODInfo(i);
-		// TODO: Get tangents from NIF
-		LODInfo->BuildSettings.bRecomputeNormals = true;
-		LODInfo->BuildSettings.bRecomputeTangents = true;
-		LODInfo->BuildSettings.bUseMikkTSpace = true;
+		LODInfo->BuildSettings.bRecomputeNormals = false;
+		LODInfo->BuildSettings.bRecomputeTangents = false;
+		LODInfo->BuildSettings.bUseMikkTSpace = false;
 
 		// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)
 		OutLODModel->NumTexCoords = FMath::Max<uint32>(OutLODModel->NumTexCoords, 1u);
