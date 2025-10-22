@@ -100,27 +100,60 @@ static TArray<SkeletalMeshImportData::FMeshWedge> GetMeshWedges(const std::vecto
 	return MeshWedges;
 }
 
-static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<SkeletalMeshImportData::FMeshWedge>& Wedges)
+static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<SkeletalMeshImportData::FMeshWedge>& Wedges, const std::vector<NiGeometryDataRef>& GeometryDataRefs)
 {
 	TArray<SkeletalMeshImportData::FMeshFace> Faces;
 	Faces.Reserve(Wedges.Num() / 3);
-
-	for (int32 Base = 0; Base + 2 < Wedges.Num(); Base += 3)
+	int32 Offset = 0;
+	for (int32 i = 0; i < GeometryDataRefs.size(); i++)
 	{
-		SkeletalMeshImportData::FMeshFace Face{};
-		Face.MeshMaterialIndex = 0;
-		Face.SmoothingGroups = 1;
+		const NiTriShapeDataRef& TriShapeData = DynamicCast<NiTriShapeData>(GeometryDataRefs[i]);
+		const std::vector<Triangle>& Triangles = TriShapeData->GetTriangles();
+		for (int32 j = 0 + Offset; j < Triangles.size() + Offset; j++)
+		{
+			SkeletalMeshImportData::FMeshFace Face{};
+			Face.MeshMaterialIndex = i;
+			Face.SmoothingGroups = 1;
 
-		Face.iWedge[0] = static_cast<uint32>(Base + 0);
-		Face.iWedge[1] = static_cast<uint32>(Base + 1);
-		Face.iWedge[2] = static_cast<uint32>(Base + 2);
+			Face.iWedge[0] = j * 3;
+			Face.iWedge[1] = j * 3 + 1;
+			Face.iWedge[2] = j * 3 + 2;
 
-		// Leave tangents zero; let the builder recompute if needed
-		Faces.Add(Face);
+			UE_LOG(LogTemp, Log, TEXT("[NIF] Face[%d]: %d, %d, %d"), j, Face.iWedge[0], Face.iWedge[1], Face.iWedge[2]);
+
+			// TODO: Tangents
+			Faces.Add(Face);
+		}
+
+		Offset += Triangles.size();
 	}
 
 	return Faces;
 }
+
+//static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<SkeletalMeshImportData::FMeshWedge>& Wedges)
+//{
+//	TArray<SkeletalMeshImportData::FMeshFace> Faces;
+//	Faces.Reserve(Wedges.Num() / 3);
+//
+//	for (int32 Base = 0; Base + 2 < Wedges.Num(); Base += 3)
+//	{
+//		SkeletalMeshImportData::FMeshFace Face{};
+//		Face.MeshMaterialIndex = 0;	// TODO: Find some way to indicate which pass we're on, and set the index accordingly
+//		Face.SmoothingGroups = 1;
+//
+//		Face.iWedge[0] = static_cast<uint32>(Base + 0);
+//		Face.iWedge[1] = static_cast<uint32>(Base + 1);
+//		Face.iWedge[2] = static_cast<uint32>(Base + 2);
+//
+//		UE_LOG(LogTemp, Log, TEXT("[NIF] Base[%d]: %d, %d, %d"), Base, Face.iWedge[0], Face.iWedge[1], Face.iWedge[2]);
+//
+//		// TODO: Tangents
+//		Faces.Add(Face);
+//	}
+//
+//	return Faces;
+//}
 
 static TArray<FVector3f> GetPoints(const std::vector<NiGeometryDataRef>& GeometryDataRefs)
 {
@@ -303,7 +336,7 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 
 		const TArray<SkeletalMeshImportData::FVertInfluence>& VertexInfluences = GetVertexInfluences(SkinInstances, GeometryDataRefs, ReferenceSkeleton);
 		const TArray<SkeletalMeshImportData::FMeshWedge>& MeshWedges = GetMeshWedges(GeometryDataRefs);
-		const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = GetMeshFaces(MeshWedges);
+		const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = GetMeshFaces(MeshWedges, GeometryDataRefs);
 		const TArray<FVector3f>& Points = GetPoints(GeometryDataRefs);
 		const TArray<int32>& PointsToOriginalMap = GetPointsToOriginalMap(GeometryDataRefs);
 		IMeshUtilities::MeshBuildOptions BuildOptions;
@@ -336,7 +369,7 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 		LODInfo->BuildSettings.bRecomputeTangents = true;
 		LODInfo->BuildSettings.bUseMikkTSpace = true;
 
-		// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)	// TODO: We are manually setting UVs to 0 because none exist before this point
+		// Ensure LOD reports at least one UV channel (NumTexCoords lives on LODModel in UE 5.4)	// TODO: We are manually setting UVs to 1 because none exist before this point
 		OutLODModel->NumTexCoords = FMath::Max<uint32>(OutLODModel->NumTexCoords, 1u);
 
 		// Materials slots	// TODO: Materials
