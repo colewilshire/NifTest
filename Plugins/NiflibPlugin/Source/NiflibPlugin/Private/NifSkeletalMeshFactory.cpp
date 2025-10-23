@@ -21,12 +21,14 @@
 #include <obj/NiSkinData.h>
 #include <obj/NiMultiTargetTransformController.h>
 #include <obj/NiMaterialProperty.h>
+#include <ImportUtils/SkeletalMeshImportUtils.h>
 
 using namespace Niflib;
 
-static TArray<SkeletalMeshImportData::FVertInfluence> GetVertexInfluences(const std::vector<NiSkinInstanceRef>& SkinInstances, const std::vector<NiGeometryDataRef>& GeometryDataRefs, const FReferenceSkeleton& ReferenceSkeleton)
+static TArray<SkeletalMeshImportData::FVertInfluence> GetVertexInfluences(const std::vector<NiSkinInstanceRef>& SkinInstances, const std::vector<NiGeometryDataRef>& GeometryDataRefs, const FReferenceSkeleton& ReferenceSkeleton, const FString& MeshName)
 {
 	TArray<SkeletalMeshImportData::FVertInfluence> VertexInfluences;
+	TArray<SkeletalMeshImportData::FRawBoneInfluence> RawBoneInfluences;
 	int32 Offset = 0;
 
 	for (int32 i = 0; i < SkinInstances.size(); i++)
@@ -40,12 +42,24 @@ static TArray<SkeletalMeshImportData::FVertInfluence> GetVertexInfluences(const 
 			for (SkinWeight SkinWeight : SkinWeights)
 			{
 				const FName BoneName = Bones[j]->GetName().c_str();
-				SkeletalMeshImportData::FVertInfluence VertexInfluence{ SkinWeight.weight, (int32)SkinWeight.index + Offset, ReferenceSkeleton.FindBoneIndex(BoneName)};
-				VertexInfluences.Add(VertexInfluence);
+				SkeletalMeshImportData::FRawBoneInfluence RawBoneInfluence { SkinWeight.weight, (int32)SkinWeight.index + Offset, ReferenceSkeleton.FindBoneIndex(BoneName)};
+				RawBoneInfluences.Add(RawBoneInfluence);
 			}
 		}
 
 		Offset += GeometryDataRefs[i]->GetVertexCount();
+	}
+
+	// Reformat influences to Unreal's standards
+	FSkeletalMeshImportData SkeletalMeshImportData;
+	SkeletalMeshImportData.Influences = RawBoneInfluences;
+
+	SkeletalMeshImportUtils::ProcessImportMeshInfluences(SkeletalMeshImportData, MeshName);
+
+	for (SkeletalMeshImportData::FRawBoneInfluence RawBoneInfluence : SkeletalMeshImportData.Influences)
+	{
+		SkeletalMeshImportData::FVertInfluence VertexInfluence{ RawBoneInfluence.Weight, RawBoneInfluence.VertexIndex, RawBoneInfluence.BoneIndex };
+		VertexInfluences.Add(VertexInfluence);
 	}
 
 	return VertexInfluences;
@@ -162,17 +176,14 @@ static TArray<FVector3f> GetPoints(const std::vector<NiGeometryDataRef>& Geometr
 
 static TArray<int32> GetPointsToOriginalMap(const std::vector<NiGeometryDataRef>& GeometryDataRefs)
 {
-	int32 VertexCount = 0;
 	TArray<int32> PointsToOriginalMap;
 
 	for (const NiGeometryDataRef& GeometryData : GeometryDataRefs)
 	{
-		VertexCount += GeometryData->GetVertexCount();
-	}
-
-	for (int i = 0; i < VertexCount; i++)
-	{
-		PointsToOriginalMap.Add(i);
+		for (int i = 0; i < GeometryData->GetVertexCount(); i++)
+		{
+			PointsToOriginalMap.Add(i);
+		}
 	}
 
 	return PointsToOriginalMap;
@@ -187,6 +198,7 @@ struct FNifReferenceSkeleton
 
 // TODO: No handling exists yet for NIFs without a skeleton and/or NiMultiTargetTransformController
 // TODO: Skeleton seems inverted. For example, the bone leg_R is on the left side
+// TODO: Try SkeletalMeshImportUtils::ProcessImportMeshSkeleton; maybe taht will fix the bine pose being off
 static FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& Bone, const int32 ParentIndex = -1, FNifReferenceSkeleton Skeleton = {})
 {
 	const Vector3 Location = Bone->GetLocalTranslation();
@@ -323,7 +335,7 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 		const FReferenceSkeleton& ReferenceSkeleton = BuildReferenceSkeleton(NifSkeleton.BoneNames, NifSkeleton.ParentIndices, NifSkeleton.RefPose);
 		SkeletalMesh->SetRefSkeleton(ReferenceSkeleton);
 
-		const TArray<SkeletalMeshImportData::FVertInfluence>& VertexInfluences = GetVertexInfluences(SkinInstances, GeometryDataRefs, ReferenceSkeleton);
+		const TArray<SkeletalMeshImportData::FVertInfluence>& VertexInfluences = GetVertexInfluences(SkinInstances, GeometryDataRefs, ReferenceSkeleton, SkeletalMesh->GetName());
 		const TArray<SkeletalMeshImportData::FMeshWedge>& MeshWedges = GetMeshWedges(GeometryDataRefs);
 		const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = GetMeshFaces(MeshWedges, GeometryDataRefs);
 		const TArray<FVector3f>& Points = GetPoints(GeometryDataRefs);
