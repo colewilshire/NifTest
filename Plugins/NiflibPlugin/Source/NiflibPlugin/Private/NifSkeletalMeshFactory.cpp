@@ -189,61 +189,51 @@ static TArray<int32> GetPointsToOriginalMap(const std::vector<NiGeometryDataRef>
 	return PointsToOriginalMap;
 }
 
-struct FNifReferenceSkeleton
-{
-	TArray<FName> BoneNames;
-	TArray<int32> ParentIndices;
-	TArray<FTransform> RefPose;
-};
-
 // TODO: No handling exists yet for NIFs without a skeleton and/or NiMultiTargetTransformController
 // TODO: Skeleton seems inverted. For example, the bone leg_R is on the left side
-// TODO: Try SkeletalMeshImportUtils::ProcessImportMeshSkeleton; maybe taht will fix the bine pose being off
-static FNifReferenceSkeleton ParseNifSkeleton(const NiNodeRef& Bone, const int32 ParentIndex = -1, FNifReferenceSkeleton Skeleton = {})
+static TArray<SkeletalMeshImportData::FBone> ParseNifSkeleton(const NiNodeRef& Bone, const USkeleton* Skeleton, const int32 ParentIndex = -1, TArray<SkeletalMeshImportData::FBone> ReferenceBones = {})
 {
 	const Vector3 Location = Bone->GetLocalTranslation();
-	Quaternion Rotation = Bone->GetLocalRotation().AsQuaternion();
+	const Quaternion Rotation = Bone->GetLocalRotation().AsQuaternion();
 	const float Scale = Bone->GetLocalScale();
+	const FName BoneName = Bone->GetName().c_str();
 
-	FTransform Transform;
-	Transform.SetLocation(FVector(Location.x, Location.y, Location.z));
-	Transform.SetRotation(FQuat(Rotation.x, Rotation.y, Rotation.z, Rotation.w));
-	Transform.SetScale3D(FVector(Scale));
+	SkeletalMeshImportData::FBone ReferenceBone;
+	ReferenceBone.Name = Bone->GetName().c_str();
+	ReferenceBone.NumChildren = Bone->GetChildren().size();
+	ReferenceBone.ParentIndex = ParentIndex;
+	ReferenceBone.BonePos.Transform = FTransform3f(
+		FQuat4f(Rotation.x, Rotation.y, Rotation.z, Rotation.w),	// Rotation
+		FVector3f(Location.x, Location.y, Location.z),	// Translation
+		FVector3f(Scale)	// Scale
+	);
+	ReferenceBones.Add(ReferenceBone);
 
-	FName BoneName = Bone->GetName().c_str();
-	Skeleton.BoneNames.Add(BoneName);
-	Skeleton.ParentIndices.Add(ParentIndex);
-	Skeleton.RefPose.Add(Transform);
-	const int32 CurrentBoneIndex = Skeleton.BoneNames.Num() - 1;
-
+	const int32 CurrentBoneIndex = ReferenceBones.Num() - 1;
 	for (const NiAVObjectRef& Child : Bone->GetChildren())
 	{
 		NiNodeRef NextBone = DynamicCast<NiNode>(Child);
 		if (NextBone)
 		{
-			Skeleton = ParseNifSkeleton(NextBone, CurrentBoneIndex, Skeleton);
+			ReferenceBones = ParseNifSkeleton(NextBone, Skeleton, CurrentBoneIndex, ReferenceBones);
 		}
 	}
 
-	return Skeleton;
+	return ReferenceBones;
 }
 
-static FReferenceSkeleton BuildReferenceSkeleton(
-	const TArray<FName>& BoneNames,
-	const TArray<int32>& ParentIndices,
-	const TArray<FTransform>& RefPose)
+static FReferenceSkeleton GetReferenceSkeleton(const NiNodeRef& RootBone, const USkeleton* Skeleton)
 {
-	FReferenceSkeleton RefSkeleton(true);
-	FReferenceSkeletonModifier Mod(RefSkeleton, nullptr);
+	FReferenceSkeleton ReferenceSkeleton;
 
-	const int32 NumBones = BoneNames.Num();
-	for (int32 i = 0; i < NumBones; ++i)
-	{
-		FMeshBoneInfo BoneInfo(BoneNames[i], FString(), ParentIndices[i]);
-		Mod.Add(BoneInfo, RefPose[i], false);
-	}
+	TArray<SkeletalMeshImportData::FBone> RefBonesBinary = ParseNifSkeleton(RootBone, Skeleton);
+	int32 BoneCount = RefBonesBinary.Num();
 
-	return RefSkeleton;
+	FSkeletalMeshImportData SkeletalMeshImportData;
+	SkeletalMeshImportData.RefBonesBinary = RefBonesBinary;
+	SkeletalMeshImportUtils::ProcessImportMeshSkeleton(Skeleton, ReferenceSkeleton, BoneCount, SkeletalMeshImportData);
+
+	return ReferenceSkeleton;
 }
 
 static std::vector<NiTriShapeRef> GetDescendantTriShapes(const NiNodeRef& Parent, std::vector<NiTriShapeRef> FoundTriShapes = {})
@@ -276,12 +266,12 @@ static std::vector<NiTriShapeRef> GetDescendantTriShapes(const NiNodeRef& Parent
 	return FoundTriShapes;
 }
 
-static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
+static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh, USkeleton* Skeleton)
 {
 	std::vector<NiObjectRef> NifList = ReadNifList(TCHAR_TO_UTF8(*Filename));
 	IMeshUtilities& MeshUtilities = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
 	NiMultiTargetTransformControllerRef MultiTargetTransformController;
-	FNifReferenceSkeleton NifSkeleton;
+	FReferenceSkeleton ReferenceSkeleton;
 
 	for (const NiObjectRef& Object : NifList)
 	{
@@ -294,7 +284,8 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 			const NiNodeRef& RootBone = DynamicCast<NiNode>(Target);
 			if (RootBone)
 			{
-				NifSkeleton = ParseNifSkeleton(RootBone);
+				ReferenceSkeleton = GetReferenceSkeleton(RootBone, Skeleton);
+				SkeletalMesh->SetRefSkeleton(ReferenceSkeleton);
 
 				break;	// There should only be one NiMultiTargetTransformController, I think, so bail once it is found.
 			}
@@ -331,9 +322,6 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh)
 			SkinInstances.push_back(TriShape->GetSkinInstance());
 			GeometryDataRefs.push_back(TriShape->GetData());
 		}
-
-		const FReferenceSkeleton& ReferenceSkeleton = BuildReferenceSkeleton(NifSkeleton.BoneNames, NifSkeleton.ParentIndices, NifSkeleton.RefPose);
-		SkeletalMesh->SetRefSkeleton(ReferenceSkeleton);
 
 		const TArray<SkeletalMeshImportData::FVertInfluence>& VertexInfluences = GetVertexInfluences(SkinInstances, GeometryDataRefs, ReferenceSkeleton, SkeletalMesh->GetName());
 		const TArray<SkeletalMeshImportData::FMeshWedge>& MeshWedges = GetMeshWedges(GeometryDataRefs);
@@ -429,13 +417,13 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 	UPackage* MeshPkg = MakeAssetPackage(BasePath, InName.ToString(), MeshObjName);
 	USkeletalMesh* SkeletalMesh = NewObject<USkeletalMesh>(MeshPkg, *MeshObjName, RF_Public | RF_Standalone);
 
-	// Parse NIF for mesh data
-	ParseNif(Filename, SkeletalMesh);
-
 	// Build skeleton
 	UPackage* SkelPkg = MakeAssetPackage(BasePath, InName.ToString() + TEXT("_Skeleton"), SkelObjName);
 	USkeleton* Skeleton = NewObject<USkeleton>(SkelPkg, *SkelObjName, RF_Public | RF_Standalone);
 	SkeletalMesh->SetSkeleton(Skeleton);
+
+	// Parse NIF for mesh data
+	ParseNif(Filename, SkeletalMesh, Skeleton);
 
 	// Finalize
 	SkeletalMesh->InvalidateDeriveDataCacheGUID();
