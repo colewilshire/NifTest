@@ -191,7 +191,7 @@ static TArray<int32> GetPointsToOriginalMap(const std::vector<NiGeometryDataRef>
 
 // TODO: No handling exists yet for NIFs without a skeleton and/or NiMultiTargetTransformController
 // TODO: Skeleton seems inverted. For example, the bone leg_R is on the left side
-static TArray<SkeletalMeshImportData::FBone> ParseNifSkeleton(const NiNodeRef& Bone, const USkeleton* Skeleton, const int32 ParentIndex = -1, TArray<SkeletalMeshImportData::FBone> ReferenceBones = {})
+static TArray<SkeletalMeshImportData::FBone> ParseNifSkeleton(const NiNodeRef& Bone, const int32 ParentIndex = -1, TArray<SkeletalMeshImportData::FBone> ReferenceBones = {})
 {
 	const Vector3 Location = Bone->GetLocalTranslation();
 	const Quaternion Rotation = Bone->GetLocalRotation().AsQuaternion();
@@ -215,7 +215,7 @@ static TArray<SkeletalMeshImportData::FBone> ParseNifSkeleton(const NiNodeRef& B
 		NiNodeRef NextBone = DynamicCast<NiNode>(Child);
 		if (NextBone)
 		{
-			ReferenceBones = ParseNifSkeleton(NextBone, Skeleton, CurrentBoneIndex, ReferenceBones);
+			ReferenceBones = ParseNifSkeleton(NextBone, CurrentBoneIndex, ReferenceBones);
 		}
 	}
 
@@ -226,11 +226,11 @@ static FReferenceSkeleton GetReferenceSkeleton(const NiNodeRef& RootBone, const 
 {
 	FReferenceSkeleton ReferenceSkeleton;
 
-	TArray<SkeletalMeshImportData::FBone> RefBonesBinary = ParseNifSkeleton(RootBone, Skeleton);
-	int32 BoneCount = RefBonesBinary.Num();
+	TArray<SkeletalMeshImportData::FBone> ReferenceBones = ParseNifSkeleton(RootBone);
+	int32 BoneCount = ReferenceBones.Num();
 
 	FSkeletalMeshImportData SkeletalMeshImportData;
-	SkeletalMeshImportData.RefBonesBinary = RefBonesBinary;
+	SkeletalMeshImportData.RefBonesBinary = ReferenceBones;
 	SkeletalMeshImportUtils::ProcessImportMeshSkeleton(Skeleton, ReferenceSkeleton, BoneCount, SkeletalMeshImportData);
 
 	return ReferenceSkeleton;
