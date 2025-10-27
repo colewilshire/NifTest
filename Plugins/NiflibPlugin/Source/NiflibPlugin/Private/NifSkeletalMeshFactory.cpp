@@ -125,7 +125,7 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<Skele
 		const std::vector<Triangle>& Triangles = TriShapeData->GetTriangles();
 		const std::vector<Vector3>& Tangents = TriShapeData->GetTangents();
 		const std::vector<Vector3>& Bitangents = TriShapeData->GetBitangents();
-		const std::vector<Vector3>& Normals = TriShapeData->GetNormals();
+		const std::vector<Vector3>& Normals = TriShapeData->GetNormals();	// TODO: We may need to use TriShape->GetSkinDeformation to get the Normals, like we did with the Vertices
 
 		for (int32 j = 0 + Offset; j < Triangles.size() + Offset; j++)
 		{
@@ -158,13 +158,18 @@ static TArray<SkeletalMeshImportData::FMeshFace> GetMeshFaces(const TArray<Skele
 	return Faces;
 }
 
-static TArray<FVector3f> GetPoints(const std::vector<NiGeometryDataRef>& GeometryDataRefs)
+static TArray<FVector3f> GetPoints(const std::vector<NiTriShapeRef>& TriShapes)
 {
 	TArray<FVector3f> Points;
 
-	for (const NiGeometryDataRef& GeometryData : GeometryDataRefs)
+	for (const NiTriShapeRef& TriShape : TriShapes)
 	{
-		for (const Vector3& Vertex : GeometryData->GetVertices())
+		const NiGeometryDataRef& GeometryData = TriShape->GetData();
+		std::vector<Vector3> Vertices = {};
+		std::vector<Vector3> Normals = {};
+		TriShape->GetSkinDeformation(Vertices, Normals);
+
+		for (const Vector3& Vertex : Vertices)
 		{
 			const FVector3f Point = { Vertex.x, Vertex.y, Vertex.z };
 			Points.Add(Point);
@@ -326,7 +331,7 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh, USkel
 		const TArray<SkeletalMeshImportData::FVertInfluence>& VertexInfluences = GetVertexInfluences(SkinInstances, GeometryDataRefs, ReferenceSkeleton, SkeletalMesh->GetName());
 		const TArray<SkeletalMeshImportData::FMeshWedge>& MeshWedges = GetMeshWedges(GeometryDataRefs);
 		const TArray<SkeletalMeshImportData::FMeshFace>& MeshFaces = GetMeshFaces(MeshWedges, GeometryDataRefs);
-		const TArray<FVector3f>& Points = GetPoints(GeometryDataRefs);
+		const TArray<FVector3f>& Points = GetPoints(LODs[i]);
 		const TArray<int32>& PointsToOriginalMap = GetPointsToOriginalMap(GeometryDataRefs);
 
 		FSkeletalMeshModel* ImportedModel = SkeletalMesh->GetImportedModel();
