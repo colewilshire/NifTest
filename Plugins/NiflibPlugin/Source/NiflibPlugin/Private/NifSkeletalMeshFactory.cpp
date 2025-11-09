@@ -51,8 +51,6 @@ static UPackage* MakeAssetPackage(const FString& BasePath, const FString& AssetN
 	return CreatePackage(*PackageName);
 }
 
-// This relies on the assumptions that X, Y, and Z rotate key arrays are all the same length, or have only keys with duplicate values
-// TODO: I am ignoring the forward and backward tangent in animation 0, which is QUADRATIC_KEY
 static std::map<float, FQuat> GetTimeToXYZRotationalKeysMap(const NiTransformInterpolatorRef& TransformInterpolator)
 {
 	const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
@@ -79,7 +77,7 @@ static std::map<float, FQuat> GetTimeToXYZRotationalKeysMap(const NiTransformInt
 	if (KeyCount == 0)
 	{
 		const Quaternion& DefaultRotation = TransformInterpolator->GetRotation();
-		const FQuat Rotation(DefaultRotation.x, DefaultRotation.y, DefaultRotation.z, DefaultRotation.w);	// TODO: This doesn't have the same XYZ to ZYX flip as in the non-zero versions
+		const FQuat Rotation(DefaultRotation.x, DefaultRotation.y, DefaultRotation.z, DefaultRotation.w);	// TODO: Missing (X, Y, Z) -> (Y, -Z, -X) flip
 		return {{0, Rotation}};
 	}
 
@@ -120,13 +118,14 @@ static std::map<float, FQuat> GetTimeToXYZRotationalKeysMap(const NiTransformInt
 	std::map<float, FQuat> TimeToXYZRotationalKeysMap;
 	for (int i = 0; i < KeyCount; i++)
 	{
-		const FRotator Rotator(RotateKeysNormalizedLength[2][i], RotateKeysNormalizedLength[1][i], RotateKeysNormalizedLength[0][i]);	// TODO: XYZ = ZYX flip?
+		const FRotator Rotator(RotateKeysNormalizedLength[1][i], -RotateKeysNormalizedLength[2][i], -RotateKeysNormalizedLength[0][i]);	// (X, Y, Z) -> (Y, -Z, -X) flip
 		TimeToXYZRotationalKeysMap[TimeKeys[i]] = Rotator.Quaternion();
 	}
 
 	return TimeToXYZRotationalKeysMap;
 }
 
+// TODO: Rotation was fixed with a (X, Y, Z) -> (Y, -Z, -X) flip; maybe we need something similar here
 static TArray<FVector> GetTranslations(const NiTransformInterpolatorRef& TransformInterpolator, const int32& KeyCount)
 {
 	const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
@@ -145,6 +144,7 @@ static TArray<FVector> GetTranslations(const NiTransformInterpolatorRef& Transfo
 	}
 	else
 	{
+		UE_LOG(LogTemp, Log, TEXT("[NIF]	>3"));
 		Translations.Reserve(KeyCount);
 		for (const Key<Vector3>& Key : TranslateKeys)
 		{
@@ -205,11 +205,11 @@ static AnimationInfo ParseKf(const FString& Filename)
 
 			UE_LOG(LogTemp, Log, TEXT("[NIF] %hs"), BoneString.c_str());
 			const std::map<float, FQuat>& TimeToXYZRotationalKeysMap = GetTimeToXYZRotationalKeysMap(TransformInterpolator);
-			for (const pair<float, FQuat>& Pair : TimeToXYZRotationalKeysMap)
-			{
-				//UE_LOG(LogTemp, Log, TEXT("[NIF]	%f: (%f, %f, %f, %f)"), Pair.first, Pair.second.W, Pair.second.X, Pair.second.Y, Pair.second.Z);
-				UE_LOG(LogTemp, Log, TEXT("[NIF]	%f: (%f, %f, %f)"), Pair.first, Pair.second.Euler().X, Pair.second.Euler().Y, Pair.second.Euler().Z);
-			}
+			//for (const pair<float, FQuat>& Pair : TimeToXYZRotationalKeysMap)
+			//{
+			//	//UE_LOG(LogTemp, Log, TEXT("[NIF]	%f: (%f, %f, %f, %f)"), Pair.first, Pair.second.W, Pair.second.X, Pair.second.Y, Pair.second.Z);
+			//	UE_LOG(LogTemp, Log, TEXT("[NIF]	%f: (%f, %f, %f)"), Pair.first, Pair.second.Euler().X, Pair.second.Euler().Y, Pair.second.Euler().Z);
+			//}
 			const TArray<FVector>& Translations = GetTranslations(TransformInterpolator, TimeToXYZRotationalKeysMap.size());
 			const TArray<FVector>& Scales = GetScales(TransformInterpolator, TimeToXYZRotationalKeysMap.size());
 			BoneCurveInfo BoneCurveInfo;
@@ -244,7 +244,6 @@ static AnimationInfo ParseKf(const FString& Filename)
 
 static void PopulateAnimationSequence(const FString& Filename, UAnimSequence& AnimSequence)
 {
-	//const FReferenceSkeleton& ReferenceSkeleton = AnimSequence.GetSkeleton()->GetReferenceSkeleton();
 	const AnimationInfo& AnimationInfo = ParseKf(Filename);
 	IAnimationDataController& AnimationController = AnimSequence.GetController();
 
@@ -256,7 +255,6 @@ static void PopulateAnimationSequence(const FString& Filename, UAnimSequence& An
 		FAnimationCurveIdentifier CurveId(BoneCurveInfo.BoneName, ERawCurveTrackTypes::RCT_Transform);
 		AnimationController.AddCurve(CurveId, 4, false);
 		AnimationController.SetTransformCurveKeys(CurveId, BoneCurveInfo.Transforms, BoneCurveInfo.TimeKeys, false);
-		//AnimationController.SetTransformCurveKeys(CurveId, { FTransform(FVector(0, 0, 0)) }, { 0 }, false);
 	}
 
 	AnimationController.NotifyPopulated();
