@@ -12,6 +12,7 @@
 #include "MeshUtilities.h"
 #include "Rendering/SkeletalMeshModel.h"
 #include "Rendering/SkeletalMeshLODImporterData.h"
+#include "ImportUtils/SkeletalMeshImportUtils.h"
 
 // Niflib
 #include <niflib.h>
@@ -21,9 +22,245 @@
 #include <obj/NiSkinData.h>
 #include <obj/NiMultiTargetTransformController.h>
 #include <obj/NiMaterialProperty.h>
-#include <ImportUtils/SkeletalMeshImportUtils.h>
+#include <obj/NiControllerSequence.h>
+#include <obj/NiStringPalette.h>
+#include <obj/NiTransformInterpolator.h>
+#include <obj/NiTransformData.h>
 
 using namespace Niflib;
+
+static struct BoneCurveInfo
+{
+	FName BoneName;
+	TArray<FTransform> Transforms;
+	TArray<float> TimeKeys;
+};
+
+static struct AnimationInfo
+{
+	float PlayLength;
+	TArray<BoneCurveInfo> BoneCurveInfos;
+};
+
+// Create a unique package under the same folder as the selected destination
+static UPackage* MakeAssetPackage(const FString& BasePath, const FString& AssetName, FString& OutObjectName)
+{
+	FString PackageName;
+	FAssetToolsModule& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+	AssetTools.Get().CreateUniqueAssetName(BasePath / AssetName, TEXT(""), PackageName, OutObjectName);
+	return CreatePackage(*PackageName);
+}
+
+// This relies on the assumptions that X, Y, and Z rotate key arrays are all the same length, or have only keys with duplicate values
+// TODO: I am ignoring the forward and backward tangent in animation 0, which is QUADRATIC_KEY
+static std::map<float, FQuat> GetTimeToXYZRotationalKeysMap(const NiTransformInterpolatorRef& TransformInterpolator)
+{
+	const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
+	const TArray<std::vector<Key<float>>>& RotateKeys =
+	{
+		TransformData->GetXRotateKeys(),
+		TransformData->GetYRotateKeys(),
+		TransformData->GetZRotateKeys()
+	};
+	int32 KeyCount = 0;
+	std::vector<Key<float>> TimeKeyArray;
+	TArray<float> TimeKeys;
+
+	for (const std::vector<Key<float>>& KeyArray : RotateKeys)
+	{
+		if (KeyArray.size() > KeyCount)
+		{
+			KeyCount = KeyArray.size();
+			TimeKeyArray = KeyArray;
+		}
+	}
+
+	// Bail and return the unreliable default value stored on the NiTransformInterpolator, if there is absolutely no other data to work with
+	if (KeyCount == 0)
+	{
+		const Quaternion& DefaultRotation = TransformInterpolator->GetRotation();
+		const FQuat Rotation(DefaultRotation.x, DefaultRotation.y, DefaultRotation.z, DefaultRotation.w);	// TODO: This doesn't have the same XYZ to ZYX flip as in the non-zero versions
+		return {{0, Rotation}};
+	}
+
+	// Get time keys from the largest array
+	for (const Key<float>& Key : TimeKeyArray)
+	{
+		TimeKeys.Add(Key.time);
+	}
+
+	// Ensure X, Y, and Z Key Arrays share the same length, in case one or more of the arrays have only identical values
+	TArray<TArray<float>> RotateKeysNormalizedLength;
+	RotateKeysNormalizedLength.Reserve(3);
+
+	for (const std::vector<Key<float>>& KeyArray : RotateKeys)
+	{
+		TArray<float> Values;
+		Values.Reserve(KeyCount);
+
+		if (KeyArray.size() < 3)
+		{
+			for (int i = 0; i < KeyCount; i++)
+			{
+				Values.Add(FMath::RadiansToDegrees(KeyArray[0].data));
+			}
+		}
+		else
+		{
+			for (const Key<float>& Key : KeyArray)
+			{
+				Values.Add(FMath::RadiansToDegrees(Key.data));
+			}
+		}
+
+		RotateKeysNormalizedLength.Add(Values);
+	}
+
+	// Create quaternion values from float arrays
+	std::map<float, FQuat> TimeToXYZRotationalKeysMap;
+	for (int i = 0; i < KeyCount; i++)
+	{
+		const FRotator Rotator(RotateKeysNormalizedLength[2][i], RotateKeysNormalizedLength[1][i], RotateKeysNormalizedLength[0][i]);	// TODO: XYZ = ZYX flip?
+		TimeToXYZRotationalKeysMap[TimeKeys[i]] = Rotator.Quaternion();
+	}
+
+	return TimeToXYZRotationalKeysMap;
+}
+
+static TArray<FVector> GetTranslations(const NiTransformInterpolatorRef& TransformInterpolator, const int32& KeyCount)
+{
+	const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
+	const std::vector<Key<Vector3>>& TranslateKeys = TransformData->GetTranslateKeys();
+	TArray<FVector> Translations;
+
+	if (TranslateKeys.size() == 0)	// THe translation value on NiTransformInterpolators are not reliable, so only use them as a last resort
+	{
+		const Vector3& Translation = TransformInterpolator->GetTranslation();
+		Translations.Init(FVector(Translation.x, Translation.y, Translation.z), KeyCount);
+	}
+	else if (TranslateKeys.size() < 3)
+	{
+		const Vector3& Translation = TranslateKeys[0].data;
+		Translations.Init(FVector(Translation.x, Translation.y, Translation.z), KeyCount);
+	}
+	else
+	{
+		Translations.Reserve(KeyCount);
+		for (const Key<Vector3>& Key : TranslateKeys)
+		{
+			const FVector Translation(Key.data.x, Key.data.y, Key.data.z);
+			Translations.Add(Translation);
+		}
+	}
+
+	return Translations;
+}
+
+static TArray<FVector> GetScales(const NiTransformInterpolatorRef& TransformInterpolator, const int32& KeyCount)
+{
+	// TODO: This simply always returns a scale value of 1
+	TArray<FVector> Scales;
+	Scales.Init(FVector(1), KeyCount);
+
+	return Scales;
+}
+
+// For some reason, the translations component of the transforms is causing the mesh to disappear
+// Maybe I need to normalize the values somehow, or perhaps it was just because I was editing the map after creation
+static AnimationInfo ParseKf(const FString& Filename)
+{
+	const FString& KfFilename = FPaths::ChangeExtension(Filename, ".kf");
+	const std::vector<NiObjectRef>& NifList = ReadNifList(TCHAR_TO_UTF8(*KfFilename));
+	std::vector<NiControllerSequenceRef> ControllerSequences;
+
+	for (const NiObjectRef& Object : NifList)
+	{
+		const NiControllerSequenceRef& ControllerSequence = DynamicCast<NiControllerSequence>(Object);
+
+		if (ControllerSequence)
+		{
+			ControllerSequences.push_back(ControllerSequence);
+		}
+	}
+
+	for (const NiControllerSequenceRef& ControllerSequence : ControllerSequences)
+	{
+		const NiStringPaletteRef& StringPalette = ControllerSequence->GetStringPalette();
+		const std::vector<ControllerLink> ControlledBlocks = ControllerSequence->GetControlledBlocks();
+		AnimationInfo AnimationInfo;
+
+		// Every ControlledBlock refers to one bone
+		for (int i = 0; i < ControlledBlocks.size(); i++)
+		{
+			std::string BoneString = StringPalette->GetSubStr(ControlledBlocks[i].nodeNameOffset);
+			if (BoneString == "root NonAccum")
+			{
+				BoneString = "root-NonAccum";
+			}
+
+			const FName BoneName = BoneString.c_str();
+			const NiInterpolatorRef& Interpolator = ControlledBlocks[i].interpolator;
+			const NiTransformInterpolatorRef& TransformInterpolator = DynamicCast<NiTransformInterpolator>(ControlledBlocks[i].interpolator);
+			const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
+
+			UE_LOG(LogTemp, Log, TEXT("[NIF] %hs"), BoneString.c_str());
+			const std::map<float, FQuat>& TimeToXYZRotationalKeysMap = GetTimeToXYZRotationalKeysMap(TransformInterpolator);
+			for (const pair<float, FQuat>& Pair : TimeToXYZRotationalKeysMap)
+			{
+				//UE_LOG(LogTemp, Log, TEXT("[NIF]	%f: (%f, %f, %f, %f)"), Pair.first, Pair.second.W, Pair.second.X, Pair.second.Y, Pair.second.Z);
+				UE_LOG(LogTemp, Log, TEXT("[NIF]	%f: (%f, %f, %f)"), Pair.first, Pair.second.Euler().X, Pair.second.Euler().Y, Pair.second.Euler().Z);
+			}
+			const TArray<FVector>& Translations = GetTranslations(TransformInterpolator, TimeToXYZRotationalKeysMap.size());
+			const TArray<FVector>& Scales = GetScales(TransformInterpolator, TimeToXYZRotationalKeysMap.size());
+			BoneCurveInfo BoneCurveInfo;
+			TArray<FQuat> Rotations;
+			BoneCurveInfo.TimeKeys.Reserve(TimeToXYZRotationalKeysMap.size());
+			BoneCurveInfo.Transforms.Reserve(TimeToXYZRotationalKeysMap.size());
+			Rotations.Reserve(TimeToXYZRotationalKeysMap.size());
+
+			for (const pair<float, FQuat>& Pair : TimeToXYZRotationalKeysMap)
+			{
+				BoneCurveInfo.TimeKeys.Add(Pair.first);
+				Rotations.Add(Pair.second);
+			}
+
+			for (int j = 0; j < Rotations.Num(); j++)
+			{
+				//const FTransform Transform(Rotations[j], Translations[j], Scales[j]);
+				const FTransform Transform(Rotations[j], FVector(0, 0, 0), Scales[j]);	// TODO: Reintroduce Translations
+				BoneCurveInfo.Transforms.Add(Transform);
+			}
+
+			BoneCurveInfo.BoneName = BoneName;
+			AnimationInfo.BoneCurveInfos.Add(BoneCurveInfo);
+		}
+
+		AnimationInfo.PlayLength = ControllerSequence->GetStopTime();
+		return AnimationInfo;	// TODO: Handle more than one AnimSequence/ControllerSequence
+	}
+
+	return {};	// TODO: Handle more than one AnimSequence/ControllerSequence
+}
+
+static void PopulateAnimationSequence(const FString& Filename, UAnimSequence& AnimSequence)
+{
+	//const FReferenceSkeleton& ReferenceSkeleton = AnimSequence.GetSkeleton()->GetReferenceSkeleton();
+	const AnimationInfo& AnimationInfo = ParseKf(Filename);
+	IAnimationDataController& AnimationController = AnimSequence.GetController();
+
+	AnimationController.InitializeModel();
+	AnimationController.SetPlayLength(AnimationInfo.PlayLength, false);
+
+	for (const BoneCurveInfo& BoneCurveInfo : AnimationInfo.BoneCurveInfos)
+	{
+		FAnimationCurveIdentifier CurveId(BoneCurveInfo.BoneName, ERawCurveTrackTypes::RCT_Transform);
+		AnimationController.AddCurve(CurveId, 4, false);
+		AnimationController.SetTransformCurveKeys(CurveId, BoneCurveInfo.Transforms, BoneCurveInfo.TimeKeys, false);
+		//AnimationController.SetTransformCurveKeys(CurveId, { FTransform(FVector(0, 0, 0)) }, { 0 }, false);
+	}
+
+	AnimationController.NotifyPopulated();
+}
 
 static TArray<SkeletalMeshImportData::FVertInfluence> GetVertexInfluences(const std::vector<NiSkinInstanceRef>& SkinInstances, const std::vector<NiGeometryDataRef>& GeometryDataRefs, const FReferenceSkeleton& ReferenceSkeleton, const FString& MeshName)
 {
@@ -271,9 +508,9 @@ static std::vector<NiTriShapeRef> GetDescendantTriShapes(const NiNodeRef& Parent
 	return FoundTriShapes;
 }
 
-static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh, USkeleton* Skeleton)
+static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh, const USkeleton* Skeleton)
 {
-	std::vector<NiObjectRef> NifList = ReadNifList(TCHAR_TO_UTF8(*Filename));
+	const std::vector<NiObjectRef>& NifList = ReadNifList(TCHAR_TO_UTF8(*Filename));
 	IMeshUtilities& MeshUtilities = FModuleManager::LoadModuleChecked<IMeshUtilities>("MeshUtilities");
 	NiMultiTargetTransformControllerRef MultiTargetTransformController;
 	FReferenceSkeleton ReferenceSkeleton;
@@ -375,15 +612,6 @@ static void ParseNif(const FString& Filename, USkeletalMesh* SkeletalMesh, USkel
 	}
 }
 
-// Create a unique package under the same folder as the selected destination
-static UPackage* MakeAssetPackage(const FString& BasePath, const FString& AssetName, FString& OutObjectName)
-{
-	FString PackageName;
-	FAssetToolsModule& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
-	AssetTools.Get().CreateUniqueAssetName(BasePath / AssetName, TEXT(""), PackageName, OutObjectName);
-	return CreatePackage(*PackageName);
-}
-
 UNifSkeletalMeshFactory::UNifSkeletalMeshFactory()
 {
 	SupportedClass = USkeletalMesh::StaticClass();
@@ -416,7 +644,7 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 
 	// Create packages/assets
 	const FString BasePath = InParent->GetOutermost()->GetName();
-	FString SkelObjName, MeshObjName;
+	FString SkelObjName, MeshObjName, AnimObjName;
 
 	// Create mesh
 	UPackage* MeshPkg = MakeAssetPackage(BasePath, InName.ToString(), MeshObjName);
@@ -435,13 +663,26 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 	Skeleton->MergeAllBonesToBoneTree(SkeletalMesh);
 	SkeletalMesh->CalculateInvRefMatrices();
 
+	// Create animation
+	UPackage* AnimPackage = MakeAssetPackage(BasePath, InName.ToString() + TEXT("_Animation"), AnimObjName);
+	UAnimSequence* AnimSequence = NewObject<UAnimSequence>(AnimPackage, *AnimObjName, RF_Public | RF_Standalone);
+	AnimSequence->SetSkeleton(Skeleton);
+	AnimSequence->SetPreviewMesh(SkeletalMesh);
+
+	// Parse KF for animation data
+	PopulateAnimationSequence(Filename, *AnimSequence);
+
 	// Register
 	FAssetRegistryModule::AssetCreated(Skeleton);
 	FAssetRegistryModule::AssetCreated(SkeletalMesh);
+	FAssetRegistryModule::AssetCreated(AnimSequence);
 	SkelPkg->MarkPackageDirty();
 	MeshPkg->MarkPackageDirty();
+	AnimSequence->MarkPackageDirty();
 	SkeletalMesh->PostEditChange();
 	Skeleton->PostEditChange();
+	AnimSequence->PostEditChange();
+	AnimSequence->RefreshCacheData();	// For editor reflection
 
 	// Force asset reload to auto-generate missing MeshDescription (I think)
 	UE_LOG(LogTemp, Log, TEXT("[NIF] Imported SkeletalMesh %s  (LODs: %d)"), *MeshObjName, SkeletalMesh->GetImportedModel()->LODModels.Num());	// Prevents crash from calling PostLoad, for some reason.
