@@ -38,6 +38,7 @@ static struct BoneCurveInfo
 
 static struct AnimationInfo
 {
+	FString AnimationName;
 	float PlayLength;
 	TArray<BoneCurveInfo> BoneCurveInfos;
 };
@@ -49,6 +50,20 @@ static UPackage* MakeAssetPackage(const FString& BasePath, const FString& AssetN
 	FAssetToolsModule& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
 	AssetTools.Get().CreateUniqueAssetName(BasePath / AssetName, TEXT(""), PackageName, OutObjectName);
 	return CreatePackage(*PackageName);
+}
+
+// Translation, Rotation, and Scale key arrays must be of the same length, or every key within a missized array must be identical
+static bool ValidateKeyArrayLength(const int32& ArrayLength, const int32& KeyCount, const std::string& Identifier, const FString& TransformComponentName)
+{
+	if (ArrayLength < 3 || ArrayLength == KeyCount)
+	{
+		return true;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[NIF] Error: %hs's %s component has an array length of %d, which does not meet the desired length of %d."),
+		Identifier.c_str(), *TransformComponentName, ArrayLength, KeyCount);
+
+	return false;
 }
 
 static std::map<float, FQuat> GetTimeToXYZRotationalKeysMap(const NiTransformInterpolatorRef& TransformInterpolator)
@@ -76,9 +91,9 @@ static std::map<float, FQuat> GetTimeToXYZRotationalKeysMap(const NiTransformInt
 	// Bail and return the unreliable default value stored on the NiTransformInterpolator, if there is absolutely no other data to work with
 	if (KeyCount == 0)
 	{
-		const Quaternion& DefaultRotation = TransformInterpolator->GetRotation();
-		const FQuat Rotation(DefaultRotation.x, DefaultRotation.y, DefaultRotation.z, DefaultRotation.w);	// TODO: Missing (X, Y, Z) -> (Y, -Z, -X) flip
-		return {{0, Rotation}};
+		const Float3& DefaultRotation = TransformInterpolator->GetRotation().AsEulerYawPitchRoll();
+		const FRotator Rotator(FMath::RadiansToDegrees(DefaultRotation[1]), -FMath::RadiansToDegrees(DefaultRotation[2]), -FMath::RadiansToDegrees(DefaultRotation[0]));	// (X, Y, Z) -> (Y, -Z, -X) flip
+		return {{0, Rotator.Quaternion()}};
 	}
 
 	// Get time keys from the largest array
@@ -132,19 +147,23 @@ static TArray<FVector> GetTranslations(const NiTransformInterpolatorRef& Transfo
 	const std::vector<Key<Vector3>>& TranslateKeys = TransformData->GetTranslateKeys();
 	TArray<FVector> Translations;
 
+	if (!ValidateKeyArrayLength(TranslateKeys.size(), KeyCount, TransformInterpolator->GetIDString(), "translate")) { return {}; }
+
 	if (TranslateKeys.size() == 0)	// THe translation value on NiTransformInterpolators are not reliable, so only use them as a last resort
 	{
 		const Vector3& Translation = TransformInterpolator->GetTranslation();
 		Translations.Init(FVector(Translation.x, Translation.y, Translation.z), KeyCount);
+		//Translations.Init(FVector(0), KeyCount);
 	}
 	else if (TranslateKeys.size() < 3)
 	{
 		const Vector3& Translation = TranslateKeys[0].data;
 		Translations.Init(FVector(Translation.x, Translation.y, Translation.z), KeyCount);
+		//Translations.Init(FVector(0), KeyCount);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Log, TEXT("[NIF]	>3"));
+		UE_LOG(LogTemp, Log, TEXT("[NIF]   >3"));	// TODO: Remove log message
 		Translations.Reserve(KeyCount);
 		for (const Key<Vector3>& Key : TranslateKeys)
 		{
@@ -158,20 +177,41 @@ static TArray<FVector> GetTranslations(const NiTransformInterpolatorRef& Transfo
 
 static TArray<FVector> GetScales(const NiTransformInterpolatorRef& TransformInterpolator, const int32& KeyCount)
 {
-	// TODO: This simply always returns a scale value of 1
 	TArray<FVector> Scales;
-	Scales.Init(FVector(1), KeyCount);
+
+	const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
+	const std::vector<Key<float>>& ScaleKeys = TransformData->GetScaleKeys();
+
+	if (!ValidateKeyArrayLength(ScaleKeys.size(), KeyCount, TransformInterpolator->GetIDString(), "scale")) { return {}; }
+
+	if (ScaleKeys.size() == 0)
+	{
+		Scales.Init(FVector(1), KeyCount);
+	}
+	else if (ScaleKeys.size() < 3)
+	{
+		Scales.Init(FVector(ScaleKeys[0].data), KeyCount);
+	}
+	else
+	{
+		Scales.Reserve(KeyCount);
+
+		for (const Key<float>& Key : ScaleKeys)
+		{
+			Scales.Add(FVector(Key.data));
+		}
+	}
 
 	return Scales;
 }
 
-// For some reason, the translations component of the transforms is causing the mesh to disappear
-// Maybe I need to normalize the values somehow, or perhaps it was just because I was editing the map after creation
-static AnimationInfo ParseKf(const FString& Filename)
+static TArray<AnimationInfo> ParseKf(const FString& Filename)
 {
 	const FString& KfFilename = FPaths::ChangeExtension(Filename, ".kf");
 	const std::vector<NiObjectRef>& NifList = ReadNifList(TCHAR_TO_UTF8(*KfFilename));
 	std::vector<NiControllerSequenceRef> ControllerSequences;
+	TArray<AnimationInfo> AnimationInfos;
+	AnimationInfos.Reserve(ControllerSequences.size());
 
 	for (const NiObjectRef& Object : NifList)
 	{
@@ -203,14 +243,13 @@ static AnimationInfo ParseKf(const FString& Filename)
 			const NiTransformInterpolatorRef& TransformInterpolator = DynamicCast<NiTransformInterpolator>(ControlledBlocks[i].interpolator);
 			const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
 
-			UE_LOG(LogTemp, Log, TEXT("[NIF] %hs"), BoneString.c_str());
+			//UE_LOG(LogTemp, Log, TEXT("[NIF] %hs"), BoneString.c_str());	// TODO: Remove log message
 			const std::map<float, FQuat>& TimeToXYZRotationalKeysMap = GetTimeToXYZRotationalKeysMap(TransformInterpolator);
-			//for (const pair<float, FQuat>& Pair : TimeToXYZRotationalKeysMap)
-			//{
-			//	//UE_LOG(LogTemp, Log, TEXT("[NIF]	%f: (%f, %f, %f, %f)"), Pair.first, Pair.second.W, Pair.second.X, Pair.second.Y, Pair.second.Z);
-			//	UE_LOG(LogTemp, Log, TEXT("[NIF]	%f: (%f, %f, %f)"), Pair.first, Pair.second.Euler().X, Pair.second.Euler().Y, Pair.second.Euler().Z);
-			//}
 			const TArray<FVector>& Translations = GetTranslations(TransformInterpolator, TimeToXYZRotationalKeysMap.size());
+			/*for (const FVector& Translation : Translations)
+			{
+				UE_LOG(LogTemp, Log, TEXT("[NIF]	(%f, %f, %f)"), Translation.X, Translation.Y, Translation.Z);
+			}*/
 			const TArray<FVector>& Scales = GetScales(TransformInterpolator, TimeToXYZRotationalKeysMap.size());
 			BoneCurveInfo BoneCurveInfo;
 			TArray<FQuat> Rotations;
@@ -235,29 +274,57 @@ static AnimationInfo ParseKf(const FString& Filename)
 			AnimationInfo.BoneCurveInfos.Add(BoneCurveInfo);
 		}
 
+		AnimationInfo.AnimationName = ControllerSequence->GetName().c_str();
 		AnimationInfo.PlayLength = ControllerSequence->GetStopTime();
-		return AnimationInfo;	// TODO: Handle more than one AnimSequence/ControllerSequence
+		AnimationInfos.Add(AnimationInfo);
+
+		return AnimationInfos;	// TODO: Support more than one animation
 	}
 
-	return {};	// TODO: Handle more than one AnimSequence/ControllerSequence
+	return AnimationInfos;
 }
 
-static void PopulateAnimationSequence(const FString& Filename, UAnimSequence& AnimSequence)
+static void CreateAnimSequences(const FString& Filename, const FString& BasePath, USkeleton* Skeleton, USkeletalMesh* SkeletalMesh)
 {
-	const AnimationInfo& AnimationInfo = ParseKf(Filename);
-	IAnimationDataController& AnimationController = AnimSequence.GetController();
+	const TArray<AnimationInfo>& AnimationInfos = ParseKf(Filename);
 
-	AnimationController.InitializeModel();
-	AnimationController.SetPlayLength(AnimationInfo.PlayLength, false);
-
-	for (const BoneCurveInfo& BoneCurveInfo : AnimationInfo.BoneCurveInfos)
+	for (const AnimationInfo& AnimationInfo : AnimationInfos)
 	{
-		FAnimationCurveIdentifier CurveId(BoneCurveInfo.BoneName, ERawCurveTrackTypes::RCT_Transform);
-		AnimationController.AddCurve(CurveId, 4, false);
-		AnimationController.SetTransformCurveKeys(CurveId, BoneCurveInfo.Transforms, BoneCurveInfo.TimeKeys, false);
-	}
+		// Create animation
+		FString AnimObjName;
+		UPackage* AnimPackage = MakeAssetPackage(BasePath, AnimationInfo.AnimationName, AnimObjName);
+		UAnimSequence* AnimSequence = NewObject<UAnimSequence>(AnimPackage, *AnimObjName, RF_Public | RF_Standalone);
+		AnimSequence->SetSkeleton(Skeleton);
+		AnimSequence->SetPreviewMesh(SkeletalMesh);
 
-	AnimationController.NotifyPopulated();
+		// KF stuff
+		IAnimationDataController& AnimationController = AnimSequence->GetController();
+		AnimationController.InitializeModel();
+		AnimationController.SetPlayLength(AnimationInfo.PlayLength, false);
+
+		for (const BoneCurveInfo& BoneCurveInfo : AnimationInfo.BoneCurveInfos)
+		{
+			FAnimationCurveIdentifier CurveId(BoneCurveInfo.BoneName, ERawCurveTrackTypes::RCT_Transform);
+			AnimationController.AddCurve(CurveId, 4, false);
+			AnimationController.SetTransformCurveKeys(CurveId, BoneCurveInfo.Transforms, BoneCurveInfo.TimeKeys, false);
+		}
+
+		/*UAnimMontage a;
+		UAnimSequence s;
+		FSlotAnimationTrack f;
+		FAnimTrack g;
+		FAnimSegment q;
+		q.AnimReference = AnimSequence;
+		a.SlotAnimTracks.Add(s);*/
+
+		AnimationController.NotifyPopulated();
+
+		// Animation cleanup
+		FAssetRegistryModule::AssetCreated(AnimSequence);
+		AnimSequence->MarkPackageDirty();
+		AnimSequence->PostEditChange();
+		AnimSequence->RefreshCacheData();	// For editor reflection
+	}
 }
 
 static TArray<SkeletalMeshImportData::FVertInfluence> GetVertexInfluences(const std::vector<NiSkinInstanceRef>& SkinInstances, const std::vector<NiGeometryDataRef>& GeometryDataRefs, const FReferenceSkeleton& ReferenceSkeleton, const FString& MeshName)
@@ -642,7 +709,7 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 
 	// Create packages/assets
 	const FString BasePath = InParent->GetOutermost()->GetName();
-	FString SkelObjName, MeshObjName, AnimObjName;
+	FString SkelObjName, MeshObjName;
 
 	// Create mesh
 	UPackage* MeshPkg = MakeAssetPackage(BasePath, InName.ToString(), MeshObjName);
@@ -661,26 +728,16 @@ UObject* UNifSkeletalMeshFactory::FactoryCreateFile(
 	Skeleton->MergeAllBonesToBoneTree(SkeletalMesh);
 	SkeletalMesh->CalculateInvRefMatrices();
 
-	// Create animation
-	UPackage* AnimPackage = MakeAssetPackage(BasePath, InName.ToString() + TEXT("_Animation"), AnimObjName);
-	UAnimSequence* AnimSequence = NewObject<UAnimSequence>(AnimPackage, *AnimObjName, RF_Public | RF_Standalone);
-	AnimSequence->SetSkeleton(Skeleton);
-	AnimSequence->SetPreviewMesh(SkeletalMesh);
-
 	// Parse KF for animation data
-	PopulateAnimationSequence(Filename, *AnimSequence);
+	CreateAnimSequences(Filename, BasePath, Skeleton, SkeletalMesh);
 
 	// Register
 	FAssetRegistryModule::AssetCreated(Skeleton);
 	FAssetRegistryModule::AssetCreated(SkeletalMesh);
-	FAssetRegistryModule::AssetCreated(AnimSequence);
 	SkelPkg->MarkPackageDirty();
 	MeshPkg->MarkPackageDirty();
-	AnimSequence->MarkPackageDirty();
 	SkeletalMesh->PostEditChange();
 	Skeleton->PostEditChange();
-	AnimSequence->PostEditChange();
-	AnimSequence->RefreshCacheData();	// For editor reflection
 
 	// Force asset reload to auto-generate missing MeshDescription (I think)
 	UE_LOG(LogTemp, Log, TEXT("[NIF] Imported SkeletalMesh %s  (LODs: %d)"), *MeshObjName, SkeletalMesh->GetImportedModel()->LODModels.Num());	// Prevents crash from calling PostLoad, for some reason.
