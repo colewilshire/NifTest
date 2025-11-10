@@ -29,6 +29,12 @@
 
 using namespace Niflib;
 
+static struct RotationalKey
+{
+	float TimeKey;
+	FQuat Rotation;
+};
+
 static struct BoneCurveInfo
 {
 	FName BoneName;
@@ -66,78 +72,53 @@ static bool ValidateKeyArrayLength(const int32& ArrayLength, const int32& KeyCou
 	return false;
 }
 
-static std::map<float, FQuat> GetTimeToXYZRotationalKeysMap(const NiTransformInterpolatorRef& TransformInterpolator)
+// TODO: Animation on sheep_run and sheep_walk seems a bit off; the legs should meet in the middle, per NifSkope, but they sprawl outward instead
+	// It is unclear to me if everything can be fixed via rotation, or the lack of functioning translations are making a big impact
+static TArray<RotationalKey> GetRotationalKeys(const NiTransformInterpolatorRef& TransformInterpolator)
 {
 	const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
-	const TArray<std::vector<Key<float>>>& RotateKeys =
+	const Float3& DefaultRotateValues = TransformInterpolator->GetRotation().AsEulerYawPitchRoll();
+	TArray<std::vector<Key<float>>> RotateKeys =
 	{
 		TransformData->GetXRotateKeys(),
 		TransformData->GetYRotateKeys(),
 		TransformData->GetZRotateKeys()
 	};
-	int32 KeyCount = 0;
-	std::vector<Key<float>> TimeKeyArray;
-	TArray<float> TimeKeys;
+	std::map<float, TArray<float>> KeyMap;
 
-	for (const std::vector<Key<float>>& KeyArray : RotateKeys)
+	// Fill map with any values the key arrays actually contain
+	for (int i = 0; i < RotateKeys.Num(); i++)
 	{
-		if (KeyArray.size() > KeyCount)
+		if (RotateKeys[i].size() == 0)
 		{
-			KeyCount = KeyArray.size();
-			TimeKeyArray = KeyArray;
+			RotateKeys[i].push_back({0, DefaultRotateValues[i]});
 		}
-	}
 
-	// Bail and return the unreliable default value stored on the NiTransformInterpolator, if there is absolutely no other data to work with
-	if (KeyCount == 0)
-	{
-		const Float3& DefaultRotation = TransformInterpolator->GetRotation().AsEulerYawPitchRoll();
-		const FRotator Rotator(FMath::RadiansToDegrees(DefaultRotation[1]), -FMath::RadiansToDegrees(DefaultRotation[2]), -FMath::RadiansToDegrees(DefaultRotation[0]));	// (X, Y, Z) -> (Y, -Z, -X) flip
-		return {{0, Rotator.Quaternion()}};
-	}
-
-	// Get time keys from the largest array
-	for (const Key<float>& Key : TimeKeyArray)
-	{
-		TimeKeys.Add(Key.time);
-	}
-
-	// Ensure X, Y, and Z Key Arrays share the same length, in case one or more of the arrays have only identical values
-	TArray<TArray<float>> RotateKeysNormalizedLength;
-	RotateKeysNormalizedLength.Reserve(3);
-
-	for (const std::vector<Key<float>>& KeyArray : RotateKeys)
-	{
-		TArray<float> Values;
-		Values.Reserve(KeyCount);
-
-		if (KeyArray.size() < 3)
+		for (const Key<float>& Key : RotateKeys[i])
 		{
-			for (int i = 0; i < KeyCount; i++)
+			if (!KeyMap.contains(Key.time))
 			{
-				Values.Add(FMath::RadiansToDegrees(KeyArray[0].data));
+				KeyMap[Key.time].Init(0, RotateKeys.Num());	// TODO: This defaults all non-existent rotation values to 0. It seems fine for now, but I am not 100% sure it is accurate.
 			}
+			KeyMap[Key.time][i] = FMath::RadiansToDegrees(Key.data);
 		}
-		else
-		{
-			for (const Key<float>& Key : KeyArray)
-			{
-				Values.Add(FMath::RadiansToDegrees(Key.data));
-			}
-		}
-
-		RotateKeysNormalizedLength.Add(Values);
 	}
 
-	// Create quaternion values from float arrays
-	std::map<float, FQuat> TimeToXYZRotationalKeysMap;
-	for (int i = 0; i < KeyCount; i++)
+	// Create quaternion values from angular float arrays
+	TArray<RotationalKey> RotationalKeys;
+
+	for (const std::pair<float, TArray<float>>& Pair : KeyMap)
 	{
-		const FRotator Rotator(RotateKeysNormalizedLength[1][i], -RotateKeysNormalizedLength[2][i], -RotateKeysNormalizedLength[0][i]);	// (X, Y, Z) -> (Y, -Z, -X) flip
-		TimeToXYZRotationalKeysMap[TimeKeys[i]] = Rotator.Quaternion();
+		const FRotator Rotator(KeyMap[Pair.first][1], -KeyMap[Pair.first][2], -KeyMap[Pair.first][0]);	// (X, Y, Z) -> (Y, -Z, -X) flip
+		const RotationalKey& RotationalKey =
+		{
+			Pair.first,
+			Rotator.Quaternion()
+		};
+		RotationalKeys.Add(RotationalKey);
 	}
 
-	return TimeToXYZRotationalKeysMap;
+	return RotationalKeys;
 }
 
 // TODO: Rotation was fixed with a (X, Y, Z) -> (Y, -Z, -X) flip; maybe we need something similar here
@@ -163,7 +144,7 @@ static TArray<FVector> GetTranslations(const NiTransformInterpolatorRef& Transfo
 	}
 	else
 	{
-		UE_LOG(LogTemp, Log, TEXT("[NIF]   >3"));	// TODO: Remove log message
+		//UE_LOG(LogTemp, Log, TEXT("[NIF]   >3"));	// TODO: Remove log message
 		Translations.Reserve(KeyCount);
 		for (const Key<Vector3>& Key : TranslateKeys)
 		{
@@ -210,8 +191,6 @@ static TArray<AnimationInfo> ParseKf(const FString& Filename)
 	const FString& KfFilename = FPaths::ChangeExtension(Filename, ".kf");
 	const std::vector<NiObjectRef>& NifList = ReadNifList(TCHAR_TO_UTF8(*KfFilename));
 	std::vector<NiControllerSequenceRef> ControllerSequences;
-	TArray<AnimationInfo> AnimationInfos;
-	AnimationInfos.Reserve(ControllerSequences.size());
 
 	for (const NiObjectRef& Object : NifList)
 	{
@@ -222,6 +201,9 @@ static TArray<AnimationInfo> ParseKf(const FString& Filename)
 			ControllerSequences.push_back(ControllerSequence);
 		}
 	}
+
+	TArray<AnimationInfo> AnimationInfos;
+	AnimationInfos.Reserve(ControllerSequences.size());
 
 	for (const NiControllerSequenceRef& ControllerSequence : ControllerSequences)
 	{
@@ -244,30 +226,23 @@ static TArray<AnimationInfo> ParseKf(const FString& Filename)
 			const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
 
 			//UE_LOG(LogTemp, Log, TEXT("[NIF] %hs"), BoneString.c_str());	// TODO: Remove log message
-			const std::map<float, FQuat>& TimeToXYZRotationalKeysMap = GetTimeToXYZRotationalKeysMap(TransformInterpolator);
-			const TArray<FVector>& Translations = GetTranslations(TransformInterpolator, TimeToXYZRotationalKeysMap.size());
+			const TArray<RotationalKey>& RotationalKeys = GetRotationalKeys(TransformInterpolator);
+			const TArray<FVector>& Translations = GetTranslations(TransformInterpolator, RotationalKeys.Num());
 			/*for (const FVector& Translation : Translations)
 			{
 				UE_LOG(LogTemp, Log, TEXT("[NIF]	(%f, %f, %f)"), Translation.X, Translation.Y, Translation.Z);
 			}*/
-			const TArray<FVector>& Scales = GetScales(TransformInterpolator, TimeToXYZRotationalKeysMap.size());
+			const TArray<FVector>& Scales = GetScales(TransformInterpolator, RotationalKeys.Num());
 			BoneCurveInfo BoneCurveInfo;
-			TArray<FQuat> Rotations;
-			BoneCurveInfo.TimeKeys.Reserve(TimeToXYZRotationalKeysMap.size());
-			BoneCurveInfo.Transforms.Reserve(TimeToXYZRotationalKeysMap.size());
-			Rotations.Reserve(TimeToXYZRotationalKeysMap.size());
+			BoneCurveInfo.TimeKeys.Reserve(RotationalKeys.Num());
+			BoneCurveInfo.Transforms.Reserve(RotationalKeys.Num());
 
-			for (const pair<float, FQuat>& Pair : TimeToXYZRotationalKeysMap)
-			{
-				BoneCurveInfo.TimeKeys.Add(Pair.first);
-				Rotations.Add(Pair.second);
-			}
-
-			for (int j = 0; j < Rotations.Num(); j++)
+			for (int j = 0; j < RotationalKeys.Num(); j++)
 			{
 				//const FTransform Transform(Rotations[j], Translations[j], Scales[j]);
-				const FTransform Transform(Rotations[j], FVector(0, 0, 0), Scales[j]);	// TODO: Reintroduce Translations
+				const FTransform Transform(RotationalKeys[j].Rotation, FVector(0, 0, 0), Scales[j]);	// TODO: Reintroduce Translations
 				BoneCurveInfo.Transforms.Add(Transform);
+				BoneCurveInfo.TimeKeys.Add(RotationalKeys[j].TimeKey);
 			}
 
 			BoneCurveInfo.BoneName = BoneName;
@@ -277,8 +252,6 @@ static TArray<AnimationInfo> ParseKf(const FString& Filename)
 		AnimationInfo.AnimationName = ControllerSequence->GetName().c_str();
 		AnimationInfo.PlayLength = ControllerSequence->GetStopTime();
 		AnimationInfos.Add(AnimationInfo);
-
-		return AnimationInfos;	// TODO: Support more than one animation
 	}
 
 	return AnimationInfos;
