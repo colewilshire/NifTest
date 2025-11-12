@@ -14,6 +14,9 @@
 #include "Rendering/SkeletalMeshLODImporterData.h"
 #include "ImportUtils/SkeletalMeshImportUtils.h"
 
+// C++
+#include <set>
+
 // Niflib
 #include <niflib.h>
 #include <obj/NiLODNode.h>
@@ -58,23 +61,45 @@ static UPackage* MakeAssetPackage(const FString& BasePath, const FString& AssetN
 	return CreatePackage(*PackageName);
 }
 
-// Translation, Rotation, and Scale key arrays must be of the same length, or every key within a missized array must be identical
-static bool ValidateKeyArrayLength(const int32& ArrayLength, const int32& KeyCount, const std::string& Identifier, const FString& TransformComponentName)
+static TArray<float> GetTimeKeys(const NiTransformInterpolatorRef& TransformInterpolator)
 {
-	if (ArrayLength < 3 || ArrayLength == KeyCount)
+	const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
+	const std::vector<std::vector<Key<float>>>& FloatKeyArrays =
 	{
-		return true;
+		TransformData->GetXRotateKeys(),
+		TransformData->GetYRotateKeys(),
+		TransformData->GetZRotateKeys(),
+		TransformData->GetScaleKeys()
+	};
+	std::set<float> KeySet;
+
+	for (const std::vector<Key<float>>& FloatKeyArray : FloatKeyArrays)
+	{
+		for (const Key<float>& Key : FloatKeyArray)
+		{
+			KeySet.insert(Key.time);
+		}
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[NIF] Error: %hs's %s component has an array length of %d, which does not meet the desired length of %d."),
-		Identifier.c_str(), *TransformComponentName, ArrayLength, KeyCount);
+	for (const Key<Vector3>& Key : TransformData->GetTranslateKeys())
+	{
+		KeySet.insert(Key.time);
+	}
 
-	return false;
+	TArray<float> TimeKeys;
+	TimeKeys.Reserve(KeySet.size());
+	
+	for (const float& Time : KeySet)
+	{
+		TimeKeys.Add(Time);
+	}
+
+	return TimeKeys;
 }
 
 // TODO: Animation on sheep_run and sheep_walk seems a bit off; the legs should meet in the middle, per NifSkope, but they sprawl outward instead
 	// It is unclear to me if everything can be fixed via rotation, or the lack of functioning translations are making a big impact
-static TArray<RotationalKey> GetRotationalKeys(const NiTransformInterpolatorRef& TransformInterpolator)
+static TArray<RotationalKey> GetRotationalKeys(const NiTransformInterpolatorRef& TransformInterpolator, const TArray<float>& TimeKeys)
 {
 	const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
 	const Float3& DefaultRotateValues = TransformInterpolator->GetRotation().AsEulerYawPitchRoll();
@@ -86,6 +111,11 @@ static TArray<RotationalKey> GetRotationalKeys(const NiTransformInterpolatorRef&
 	};
 	std::map<float, TArray<float>> KeyMap;
 
+	for (const float& TimeKey : TimeKeys)
+	{
+		KeyMap[TimeKey].Init(0, RotateKeys.Num());	// TODO: This defaults all non-existent rotation component values to 0. It seems fine for now, but I am not 100% sure it is accurate.
+	}
+
 	// Fill map with any values the key arrays actually contain
 	for (int i = 0; i < RotateKeys.Num(); i++)
 	{
@@ -96,10 +126,10 @@ static TArray<RotationalKey> GetRotationalKeys(const NiTransformInterpolatorRef&
 
 		for (const Key<float>& Key : RotateKeys[i])
 		{
-			if (!KeyMap.contains(Key.time))
-			{
-				KeyMap[Key.time].Init(0, RotateKeys.Num());	// TODO: This defaults all non-existent rotation values to 0. It seems fine for now, but I am not 100% sure it is accurate.
-			}
+			//if (!KeyMap.contains(Key.time))
+			//{
+			//	KeyMap[Key.time].Init(0, RotateKeys.Num());	// TODO: This defaults all non-existent rotation component values to 0. It seems fine for now, but I am not 100% sure it is accurate.
+			//}
 			KeyMap[Key.time][i] = FMath::RadiansToDegrees(Key.data);
 		}
 	}
@@ -128,7 +158,7 @@ static TArray<FVector> GetTranslations(const NiTransformInterpolatorRef& Transfo
 	const std::vector<Key<Vector3>>& TranslateKeys = TransformData->GetTranslateKeys();
 	TArray<FVector> Translations;
 
-	if (!ValidateKeyArrayLength(TranslateKeys.size(), KeyCount, TransformInterpolator->GetIDString(), "translate")) { return {}; }
+	//if (!ValidateKeyArrayLength(TranslateKeys.size(), KeyCount, TransformInterpolator->GetIDString(), "translate")) { return {}; }
 
 	if (TranslateKeys.size() == 0)	// THe translation value on NiTransformInterpolators are not reliable, so only use them as a last resort
 	{
@@ -163,7 +193,7 @@ static TArray<FVector> GetScales(const NiTransformInterpolatorRef& TransformInte
 	const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
 	const std::vector<Key<float>>& ScaleKeys = TransformData->GetScaleKeys();
 
-	if (!ValidateKeyArrayLength(ScaleKeys.size(), KeyCount, TransformInterpolator->GetIDString(), "scale")) { return {}; }
+	//if (!ValidateKeyArrayLength(ScaleKeys.size(), KeyCount, TransformInterpolator->GetIDString(), "scale")) { return {}; }
 
 	if (ScaleKeys.size() == 0)
 	{
@@ -226,7 +256,8 @@ static TArray<AnimationInfo> ParseKf(const FString& Filename)
 			const NiTransformDataRef& TransformData = TransformInterpolator->GetData();
 
 			//UE_LOG(LogTemp, Log, TEXT("[NIF] %hs"), BoneString.c_str());	// TODO: Remove log message
-			const TArray<RotationalKey>& RotationalKeys = GetRotationalKeys(TransformInterpolator);
+			const TArray<float>& TimeKeys = GetTimeKeys(TransformInterpolator);
+			const TArray<RotationalKey>& RotationalKeys = GetRotationalKeys(TransformInterpolator, TimeKeys);
 			const TArray<FVector>& Translations = GetTranslations(TransformInterpolator, RotationalKeys.Num());
 			/*for (const FVector& Translation : Translations)
 			{
