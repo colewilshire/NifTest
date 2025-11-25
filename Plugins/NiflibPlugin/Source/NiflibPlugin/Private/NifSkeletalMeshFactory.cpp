@@ -477,7 +477,7 @@ static TArray<FVector3f> GetPoints(const std::vector<NiTriShapeRef>& TriShapes)
 
 		for (const Vector3& Vertex : Vertices)
 		{
-			const FVector3f Point = { Vertex.x, Vertex.y, Vertex.z };
+			const FVector3f Point = TriShape->GetLocalScale() * FVector3f(Vertex.x, Vertex.y, Vertex.z);
 			Points.Add(Point);
 		}
 	}
